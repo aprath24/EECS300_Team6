@@ -1,5 +1,6 @@
 #include <Wire.h>
 #include <VL53L1X.h>
+#include <VL53L0X.h>
 #include "WirelessCommunication.h"
 #include "sharedVariable.h"
 #include "Preferences.h"
@@ -9,7 +10,9 @@
 // ========== Sensor Configuration ==========
 // Four sensors: Left Inner (LI), Left Outer (LO), Right Inner (RI), Right Outer (RO)
 const uint8_t xshutPins[4] = {18, 16, 17, 19};  // assign any free GPIOs
-VL53L1X sensors[4];
+VL53L1X sensorsL1[4];   // VL53L1X sensor objects
+VL53L0X sensorsL0[4];   // VL53L0X sensor objects (fallback)
+bool useL1X = true;      // true = using L1X, false = using L0X (set during init)
 enum { LI = 0, LO = 1, RI = 2, RO = 3 };
 
 // Distance thresholds (mm) – tune for your doorway width
@@ -69,7 +72,7 @@ void setup() {
   init_wifi_task();
   INIT_SHARED_VARIABLE(x, peopleCount);
   
-  Serial.println("6‑zone people counter ready");
+  Serial.println("6-zone people counter ready");
   Serial.println("Zones: Left-Near/Mid/Far, Right-Near/Mid/Far");
 }
 
@@ -91,26 +94,68 @@ void loop() {
 
 // ========== Sensor Initialization ==========
 void initSensors() {
-  // Reset all sensors
+  // Reset all sensors via XSHUT
   for (int i = 0; i < 4; i++) {
     pinMode(xshutPins[i], OUTPUT);
     digitalWrite(xshutPins[i], LOW);
   }
   delay(10);
   
-  // Enable and init one by one, assign unique addresses
-  for (int i = 0; i < 4; i++) {
+  // --- Auto-detect sensor type on the first sensor ---
+  pinMode(xshutPins[0], INPUT);   // bring sensor 0 out of reset
+  delay(50);
+  
+  // Try VL53L1X first
+  sensorsL1[0].setTimeout(500);
+  if (sensorsL1[0].init()) {
+    useL1X = true;
+    Serial.println("Detected VL53L1X sensors");
+    sensorsL1[0].setAddress(0x2A);
+    sensorsL1[0].startContinuous(100);
+    Serial.println("Sensor 0 at address 0x2A");
+  } else {
+    // VL53L1X failed, try VL53L0X
+    sensorsL0[0].setTimeout(500);
+    if (sensorsL0[0].init()) {
+      useL1X = false;
+      Serial.println("Detected VL53L0X sensors");
+      sensorsL0[0].setAddress(0x2A);
+      sensorsL0[0].startContinuous(100);
+      Serial.println("Sensor 0 at address 0x2A");
+    } else {
+      Serial.println("Sensor 0 init failed (neither L1X nor L0X)");
+      while (1);
+    }
+  }
+  
+  // --- Init remaining sensors with the detected type ---
+  for (int i = 1; i < 4; i++) {
     pinMode(xshutPins[i], INPUT);
     delay(50);
-    sensors[i].setTimeout(500);
-    if (!sensors[i].init()) {
+    
+    bool ok = false;
+    if (useL1X) {
+      sensorsL1[i].setTimeout(500);
+      ok = sensorsL1[i].init();
+      if (ok) {
+        sensorsL1[i].setAddress(0x2A + i);
+        sensorsL1[i].startContinuous(100);
+      }
+    } else {
+      sensorsL0[i].setTimeout(500);
+      ok = sensorsL0[i].init();
+      if (ok) {
+        sensorsL0[i].setAddress(0x2A + i);
+        sensorsL0[i].startContinuous(100);
+      }
+    }
+    
+    if (!ok) {
       Serial.print("Sensor ");
       Serial.print(i);
       Serial.println(" init failed");
       while (1);
     }
-    sensors[i].setAddress(0x2A + i);   // 0x2A, 0x2B, 0x2C, 0x2D
-    sensors[i].startContinuous(100);   // 10 Hz
     Serial.print("Sensor ");
     Serial.print(i);
     Serial.print(" at address 0x");
@@ -120,7 +165,11 @@ void initSensors() {
 
 void readAllDistances(uint16_t dist[4]) {
   for (int i = 0; i < 4; i++) {
-    dist[i] = sensors[i].read();
+    if (useL1X) {
+      dist[i] = sensorsL1[i].read();
+    } else {
+      dist[i] = sensorsL0[i].readRangeContinuousMillimeters();
+    }
     delay(1);   // let I2C bus settle
   }
 }
