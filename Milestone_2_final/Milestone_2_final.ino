@@ -20,18 +20,26 @@ const uint16_t NEAR_THRESH = 400;   // 0-400 mm = near zone
 const uint16_t MID_THRESH  = 800;   // 400-800 mm = mid zone
 const uint16_t FAR_THRESH  = 1200;  // 800-1200 mm = far zone; >1200 = no detection
 
-// Logical zones
-enum Zone { ZONE_NONE, LEFT_NEAR, LEFT_MID, LEFT_FAR, RIGHT_NEAR, RIGHT_MID, RIGHT_FAR };
+// Detection threshold – any reading below this means someone is in the doorway
+// (each sensor's near/mid/far zones are all below this cutoff)
+const uint16_t DETECT_THRESH = FAR_THRESH;  // 1200 mm
 
 // ========== Global Variables ==========
 volatile int32_t peopleCount = 0;
 volatile shared_uint32 x;
 Preferences nonVol;
 
-// Unified state machine for person tracking
-enum SideState { STATE_OUTSIDE, STATE_FAR, STATE_MID, STATE_NEAR };
-SideState trackState = STATE_OUTSIDE;
-int moveDirection = 0;        // 1=entering (from far), -1=exiting (from near), 0=unknown
+// Dual-beam state machine for direction detection
+//   Outer row = LO, RO  (hallway side of door frame)
+//   Inner row = LI, RI  (room side of door frame)
+//   Entry: outer triggers first, then inner confirms
+//   Exit:  inner triggers first, then outer confirms
+enum DoorState {
+  DOOR_IDLE,          // Nobody detected
+  DOOR_OUTER_FIRST,   // Outer row triggered first → potential entry
+  DOOR_INNER_FIRST    // Inner row triggered first → potential exit
+};
+DoorState doorState = DOOR_IDLE;
 bool eventFired = false;      // has an entry/exit been counted this traversal?
 
 // For single-file detection
@@ -43,18 +51,13 @@ const unsigned long SINGLE_FILE_WINDOW = 500; // ms
 unsigned long lastActiveTime = 0;
 const unsigned long INACTIVITY_TIMEOUT = 1000; // ms
 
-// For debouncing zone transitions
-unsigned long lastZoneChange = 0;
-const unsigned long DEBOUNCE_MS = 100;
-
 // ========== Function Prototypes ==========
 void initSensors();
 void readAllDistances(uint16_t dist[4]);
-float getAverageLeft(uint16_t dist[4]);
-float getAverageRight(uint16_t dist[4]);
-Zone getZone(float avgLeft, float avgRight);
-void updateCounting(Zone zone);
-int estimateGroupSize();
+bool isOuterRowActive(uint16_t dist[4]);
+bool isInnerRowActive(uint16_t dist[4]);
+void updateCounting(bool outerActive, bool innerActive, uint16_t dist[4]);
+int estimateGroupSize(uint16_t dist[4]);
 void countEvent(int direction, int group);
 void updateNonVolatile();
 void updateSharedVar();
@@ -72,8 +75,8 @@ void setup() {
   init_wifi_task();
   INIT_SHARED_VARIABLE(x, peopleCount);
   
-  Serial.println("6-zone people counter ready");
-  Serial.println("Zones: Left-Near/Mid/Far, Right-Near/Mid/Far");
+  Serial.println("Dual-beam people counter ready");
+  Serial.println("Layout: LO/RO (outer row) | LI/RI (inner row)");
 }
 
 // ========== Main Loop ==========
@@ -81,11 +84,10 @@ void loop() {
   uint16_t dist[4];
   readAllDistances(dist);
   
-  float avgLeft = getAverageLeft(dist);
-  float avgRight = getAverageRight(dist);
-  Zone zone = getZone(avgLeft, avgRight);
+  bool outerActive = isOuterRowActive(dist);
+  bool innerActive = isInnerRowActive(dist);
   
-  updateCounting(zone);
+  updateCounting(outerActive, innerActive, dist);
   updateSharedVar();
   updateNonVolatile();
   
@@ -174,72 +176,29 @@ void readAllDistances(uint16_t dist[4]) {
   }
 }
 
-float getAverageLeft(uint16_t dist[4]) {
-  return (dist[LI] + dist[LO]) / 2.0f;
+// ========== Row Detection ==========
+// A row is "active" when at least one sensor on that row detects a person
+bool isOuterRowActive(uint16_t dist[4]) {
+  return (dist[LO] < DETECT_THRESH) || (dist[RO] < DETECT_THRESH);
 }
 
-float getAverageRight(uint16_t dist[4]) {
-  return (dist[RI] + dist[RO]) / 2.0f;
-}
-
-// Map average distances to logical zones
-Zone getZone(float avgLeft, float avgRight) {
-  // Determine left zone
-  Zone leftZone = ZONE_NONE;
-  if (avgLeft < NEAR_THRESH) leftZone = LEFT_NEAR;
-  else if (avgLeft < MID_THRESH) leftZone = LEFT_MID;
-  else if (avgLeft < FAR_THRESH) leftZone = LEFT_FAR;
-  
-  // Determine right zone
-  Zone rightZone = ZONE_NONE;
-  if (avgRight < NEAR_THRESH) rightZone = RIGHT_NEAR;
-  else if (avgRight < MID_THRESH) rightZone = RIGHT_MID;
-  else if (avgRight < FAR_THRESH) rightZone = RIGHT_FAR;
-  
-  // If both sides are active, return the one with smaller distance (closer person)
-  // This avoids double counting the same person when they are in the center.
-  if (leftZone != ZONE_NONE && rightZone != ZONE_NONE) {
-    return (avgLeft < avgRight) ? leftZone : rightZone;
-  }
-  if (leftZone != ZONE_NONE) return leftZone;
-  if (rightZone != ZONE_NONE) return rightZone;
-  return ZONE_NONE;
+bool isInnerRowActive(uint16_t dist[4]) {
+  return (dist[LI] < DETECT_THRESH) || (dist[RI] < DETECT_THRESH);
 }
 
 // ========== Counting State Machine ==========
-// Uses direction tracking: first appearance at FAR/MID = entering,
-// first appearance at NEAR = exiting. Events fire only when
-// the person completes the traversal in their initial direction.
-void updateCounting(Zone zone) {
-  // Debounce: ignore rapid zone changes within DEBOUNCE_MS
-  static Zone lastZone = ZONE_NONE;
-  if (zone != lastZone) {
-    if (millis() - lastZoneChange < DEBOUNCE_MS) return;
-    lastZoneChange = millis();
-    lastZone = zone;
-  }
+// Direction is determined by which row (outer vs inner) triggers first.
+//   Outer first → person walking IN from hallway  → entry (+1)
+//   Inner first → person walking OUT from room    → exit  (-1)
+// The event is counted when the SECOND row also becomes active,
+// confirming the person has crossed both beams.
+void updateCounting(bool outerActive, bool innerActive, uint16_t dist[4]) {
+  bool anyActive = outerActive || innerActive;
   
-  // Extract level from zone: 0=none, 1=far, 2=mid, 3=near
-  int level = 0;
-  switch (zone) {
-    case LEFT_FAR:  case RIGHT_FAR:  level = 1; break;
-    case LEFT_MID:  case RIGHT_MID:  level = 2; break;
-    case LEFT_NEAR: case RIGHT_NEAR: level = 3; break;
-    default: level = 0;
-  }
-  
-  // ---- Handle no detection (ZONE_NONE) ----
-  if (level == 0) {
+  // ---- Inactivity timeout: reset when nobody detected for a while ----
+  if (!anyActive) {
     if (millis() - lastActiveTime > INACTIVITY_TIMEOUT) {
-      // Finalize pending fast exit: person was exiting and reached
-      // at least MID but we missed FAR (walked out very quickly)
-      if (moveDirection == -1 && !eventFired &&
-          (trackState == STATE_MID || trackState == STATE_FAR)) {
-        countEvent(-1, 1);
-      }
-      // Reset state for next person
-      trackState = STATE_OUTSIDE;
-      moveDirection = 0;
+      doorState = DOOR_IDLE;
       eventFired = false;
     }
     return;
@@ -247,79 +206,68 @@ void updateCounting(Zone zone) {
   
   lastActiveTime = millis();
   
-  // ---- State machine transitions ----
-  if (trackState == STATE_OUTSIDE) {
-    // First detection: determine direction from which zone appeared
+  // ---- State machine ----
+  switch (doorState) {
+    case DOOR_IDLE:
+      if (outerActive && !innerActive) {
+        doorState = DOOR_OUTER_FIRST;
+        eventFired = false;
+        Serial.println("Outer row triggered first (potential entry)");
+      }
+      else if (innerActive && !outerActive) {
+        doorState = DOOR_INNER_FIRST;
+        eventFired = false;
+        Serial.println("Inner row triggered first (potential exit)");
+      }
+      else if (outerActive && innerActive) {
+        // Both rows triggered simultaneously – very fast traversal.
+        // Default to entry (more common case).
+        doorState = DOOR_OUTER_FIRST;
+        eventFired = false;
+        Serial.println("Both rows triggered simultaneously (assuming entry)");
+      }
+      break;
+      
+    case DOOR_OUTER_FIRST:
+      // Waiting for inner row to confirm entry
+      if (innerActive && !eventFired) {
+        // Person crossed from outer to inner → ENTRY
+        countEvent(1, estimateGroupSize(dist));
+        eventFired = true;
+      }
+      break;
+      
+    case DOOR_INNER_FIRST:
+      // Waiting for outer row to confirm exit
+      if (outerActive && !eventFired) {
+        // Person crossed from inner to outer → EXIT
+        countEvent(-1, estimateGroupSize(dist));
+        eventFired = true;
+      }
+      break;
+  }
+  
+  // After event fires and both rows clear, reset to IDLE
+  if (eventFired && !outerActive && !innerActive) {
+    doorState = DOOR_IDLE;
     eventFired = false;
-    if (level == 3) {
-      trackState = STATE_NEAR;
-      moveDirection = -1;  // appeared at NEAR → exiting (came from inside)
-    } else if (level == 2) {
-      trackState = STATE_MID;
-      moveDirection = 1;   // appeared at MID → entering
-    } else {
-      trackState = STATE_FAR;
-      moveDirection = 1;   // appeared at FAR → entering
-    }
-  }
-  else if (trackState == STATE_FAR) {
-    if (level == 2) {
-      trackState = STATE_MID;
-    }
-    else if (level == 3) {
-      trackState = STATE_NEAR;
-      // Entering direction reached NEAR → count entry
-      if (moveDirection == 1 && !eventFired) {
-        countEvent(1, estimateGroupSize());
-        eventFired = true;
-      }
-    }
-    // level==1: still at FAR, no change needed
-  }
-  else if (trackState == STATE_MID) {
-    if (level == 3) {
-      trackState = STATE_NEAR;
-      // Entering direction reached NEAR → count entry
-      if (moveDirection == 1 && !eventFired) {
-        countEvent(1, estimateGroupSize());
-        eventFired = true;
-      }
-    }
-    else if (level == 1) {
-      trackState = STATE_FAR;
-      // Exiting direction reached FAR → count exit
-      if (moveDirection == -1 && !eventFired) {
-        countEvent(-1, estimateGroupSize());
-        eventFired = true;
-      }
-    }
-  }
-  else if (trackState == STATE_NEAR) {
-    if (level == 2) {
-      trackState = STATE_MID;
-    }
-    else if (level == 1) {
-      trackState = STATE_FAR;
-      // Exiting direction reached FAR → count exit
-      if (moveDirection == -1 && !eventFired) {
-        countEvent(-1, estimateGroupSize());
-        eventFired = true;
-      }
-    }
   }
 }
 
-// Estimate group size (1 or 2) by checking if both left and right near zones are active
-int estimateGroupSize() {
-  uint16_t dist[4];
-  readAllDistances(dist);
-  float avgLeft = getAverageLeft(dist);
-  float avgRight = getAverageRight(dist);
+// Estimate group size (1 or 2) by checking if both left and right
+// sensors on the active row detect someone within NEAR_THRESH
+int estimateGroupSize(uint16_t dist[4]) {
+  // Check both sides of the outer row
+  bool leftOuter = (dist[LO] < NEAR_THRESH);
+  bool rightOuter = (dist[RO] < NEAR_THRESH);
   
-  bool leftNear = (avgLeft < NEAR_THRESH);
-  bool rightNear = (avgRight < NEAR_THRESH);
+  // Check both sides of the inner row
+  bool leftInner = (dist[LI] < NEAR_THRESH);
+  bool rightInner = (dist[RI] < NEAR_THRESH);
   
-  if (leftNear && rightNear) return 2;
+  // If both left and right sensors on ANY row are in near zone,
+  // there are likely 2 people side by side
+  if ((leftOuter && rightOuter) || (leftInner && rightInner)) return 2;
   return 1;
 }
 
