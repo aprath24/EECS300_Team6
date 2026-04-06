@@ -1,14 +1,14 @@
 #include <Wire.h>
-#include <VL53L1X.h>
-#include <VL53L0X.h>
+#include "Adafruit_VL53L1X.h"
+#include "Adafruit_VL53L0X.h"
 #include "WirelessCommunication.h"
 #include "sharedVariable.h"
 #include "Preferences.h"
 #include "config.h"
 
 // ========== Object Declarations ==========
-VL53L1X sensorsL1[4];   // VL53L1X sensor objects
-VL53L0X sensorsL0[4];   // VL53L0X sensor objects (fallback)
+Adafruit_VL53L1X sensorsL1[4];   // Adafruit VL53L1X sensor objects
+Adafruit_VL53L0X sensorsL0[4];   // Adafruit VL53L0X sensor objects (fallback)
 bool useL1X = true;      // true = using L1X, false = using L0X (set during init)
 
 // ========== Global Variables ==========
@@ -108,22 +108,17 @@ void initSensors() {
   pinMode(xshutPins[0], INPUT);   // bring sensor 0 out of reset
   delay(50);
   
-  // Try VL53L1X first
-  sensorsL1[0].setTimeout(500);
-  if (sensorsL1[0].init()) {
+  // Try Adafruit VL53L1X first (assigns address 0x2A immediately)
+  if (sensorsL1[0].begin(0x2A, &Wire)) {
     useL1X = true;
-    Serial.println("Detected VL53L1X sensors");
-    sensorsL1[0].setAddress(0x2A);
-    sensorsL1[0].startContinuous(100);
+    Serial.println("Detected VL53L1X/VL53L1CX sensors");
+    sensorsL1[0].startRanging();
     Serial.println("Sensor 0 at address 0x2A");
   } else {
-    // VL53L1X failed, try VL53L0X
-    sensorsL0[0].setTimeout(500);
-    if (sensorsL0[0].init()) {
+    // VL53L1X failed, try Adafruit VL53L0X
+    if (sensorsL0[0].begin(0x2A)) {
       useL1X = false;
       Serial.println("Detected VL53L0X sensors");
-      sensorsL0[0].setAddress(0x2A);
-      sensorsL0[0].startContinuous(100);
       Serial.println("Sensor 0 at address 0x2A");
     } else {
       Serial.println("Sensor 0 init failed (neither L1X nor L0X)");
@@ -138,19 +133,12 @@ void initSensors() {
     
     bool ok = false;
     if (useL1X) {
-      sensorsL1[i].setTimeout(500);
-      ok = sensorsL1[i].init();
+      ok = sensorsL1[i].begin(0x2A + i, &Wire);
       if (ok) {
-        sensorsL1[i].setAddress(0x2A + i);
-        sensorsL1[i].startContinuous(100);
+        sensorsL1[i].startRanging();
       }
     } else {
-      sensorsL0[i].setTimeout(500);
-      ok = sensorsL0[i].init();
-      if (ok) {
-        sensorsL0[i].setAddress(0x2A + i);
-        sensorsL0[i].startContinuous(100);
-      }
+      ok = sensorsL0[i].begin(0x2A + i);
     }
     
     if (!ok) {
@@ -169,9 +157,20 @@ void initSensors() {
 void readAllDistances(uint16_t dist[4]) {
   for (int i = 0; i < 4; i++) {
     if (useL1X) {
-      dist[i] = sensorsL1[i].read();
+      if (sensorsL1[i].dataReady()) {
+        dist[i] = sensorsL1[i].distance();
+        sensorsL1[i].clearInterrupt();
+      }
+      // If data not ready, we keep the previous value in dist[i] 
+      // or it defaults to initial value if this is the first loop.
     } else {
-      dist[i] = sensorsL0[i].readRangeContinuousMillimeters();
+      VL53L0X_RangingMeasurementData_t measure;
+      sensorsL0[i].rangingTest(&measure, false);
+      if (measure.RangeStatus != 4) { // 4 = out of range
+        dist[i] = measure.RangeMilliMeter;
+      } else {
+        dist[i] = 2000; // default for no detection
+      }
     }
     delay(1);   // let I2C bus settle
   }
