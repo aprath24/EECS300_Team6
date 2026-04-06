@@ -42,21 +42,40 @@ enum DoorState {
 DoorState doorState = DOOR_IDLE;
 bool eventFired = false;      // has an entry/exit been counted this traversal?
 
-// For single-file detection
+// Timestamps for when each row first became active in this cycle
+unsigned long outerFirstActiveTime = 0;
+unsigned long innerFirstActiveTime = 0;
+bool outerWasActive = false;  // previous-loop state for edge detection
+bool innerWasActive = false;
+
+// Debounce: a row must stay active for this many ms to count as a real trigger
+const unsigned long DEBOUNCE_MS = 40;
+unsigned long outerDebounceStart = 0;
+unsigned long innerDebounceStart = 0;
+bool outerConfirmed = false;  // passed debounce
+bool innerConfirmed = false;
+
+// Partial-entry timeout: if only one row triggers and the second never does,
+// reset after this window (person peeked in / walked into frame and backed out)
+const unsigned long PARTIAL_TIMEOUT = 1500; // ms
+unsigned long stateEntryTime = 0;  // when we entered OUTER_FIRST or INNER_FIRST
+
+// For single-file / tailgating detection
 unsigned long lastEventTime = 0;
 int lastDirection = 0;       // 1=entry, -1=exit
-const unsigned long SINGLE_FILE_WINDOW = 500; // ms
+const unsigned long COOLDOWN_MS = 300; // min time between two same-direction events
 
 // Inactivity tracking
 unsigned long lastActiveTime = 0;
-const unsigned long INACTIVITY_TIMEOUT = 1000; // ms
+const unsigned long INACTIVITY_TIMEOUT = 1500; // ms – longer to avoid premature resets
 
 // ========== Function Prototypes ==========
 void initSensors();
 void readAllDistances(uint16_t dist[4]);
 bool isOuterRowActive(uint16_t dist[4]);
 bool isInnerRowActive(uint16_t dist[4]);
-void updateCounting(bool outerActive, bool innerActive, uint16_t dist[4]);
+void updateDebouncedRows(bool outerRaw, bool innerRaw);
+void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]);
 int estimateGroupSize(uint16_t dist[4]);
 void countEvent(int direction, int group);
 void updateNonVolatile();
@@ -186,71 +205,163 @@ bool isInnerRowActive(uint16_t dist[4]) {
   return (dist[LI] < DETECT_THRESH) || (dist[RI] < DETECT_THRESH);
 }
 
+// ========== Debounced Row Detection ==========
+// Returns true only if the raw row signal has been continuously active
+// for at least DEBOUNCE_MS.  This filters out momentary noise / reflections
+// that happen when someone brushes the door frame.
+void updateDebouncedRows(bool outerRaw, bool innerRaw) {
+  unsigned long now = millis();
+
+  // --- Outer row debounce ---
+  if (outerRaw) {
+    if (outerDebounceStart == 0) outerDebounceStart = now;
+    if (now - outerDebounceStart >= DEBOUNCE_MS) outerConfirmed = true;
+  } else {
+    outerDebounceStart = 0;
+    outerConfirmed = false;
+  }
+
+  // --- Inner row debounce ---
+  if (innerRaw) {
+    if (innerDebounceStart == 0) innerDebounceStart = now;
+    if (now - innerDebounceStart >= DEBOUNCE_MS) innerConfirmed = true;
+  } else {
+    innerDebounceStart = 0;
+    innerConfirmed = false;
+  }
+}
+
 // ========== Counting State Machine ==========
 // Direction is determined by which row (outer vs inner) triggers first.
 //   Outer first → person walking IN from hallway  → entry (+1)
 //   Inner first → person walking OUT from room    → exit  (-1)
 // The event is counted when the SECOND row also becomes active,
 // confirming the person has crossed both beams.
-void updateCounting(bool outerActive, bool innerActive, uint16_t dist[4]) {
+//
+// Edge-case handling:
+//   • Tailgating: after an event fires, the machine re-arms as soon as
+//     the first-triggered row clears (even if the other is still blocked
+//     by the next person).
+//   • Fast traversal: when both rows trigger simultaneously from IDLE,
+//     timestamps are compared to infer direction.
+//   • Door-frame loitering: if only one row ever triggers, the partial-
+//     entry timeout resets the machine without counting.
+void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
+  // Step 1: debounce the raw signals
+  updateDebouncedRows(outerRaw, innerRaw);
+  bool outerActive = outerConfirmed;
+  bool innerActive = innerConfirmed;
+
   bool anyActive = outerActive || innerActive;
-  
-  // ---- Inactivity timeout: reset when nobody detected for a while ----
+  unsigned long now = millis();
+
+  // ---- Track rising edges to record first-trigger timestamps ----
+  if (outerActive && !outerWasActive)  outerFirstActiveTime = now;
+  if (innerActive && !innerWasActive)  innerFirstActiveTime = now;
+  outerWasActive = outerActive;
+  innerWasActive = innerActive;
+
+  // ---- Inactivity timeout: full reset when nobody detected ----
   if (!anyActive) {
-    if (millis() - lastActiveTime > INACTIVITY_TIMEOUT) {
+    if (now - lastActiveTime > INACTIVITY_TIMEOUT) {
       doorState = DOOR_IDLE;
       eventFired = false;
     }
     return;
   }
-  
-  lastActiveTime = millis();
-  
+
+  lastActiveTime = now;
+
   // ---- State machine ----
   switch (doorState) {
     case DOOR_IDLE:
       if (outerActive && !innerActive) {
         doorState = DOOR_OUTER_FIRST;
+        stateEntryTime = now;
         eventFired = false;
-        Serial.println("Outer row triggered first (potential entry)");
+        Serial.println("[SM] Outer first → potential ENTRY");
       }
       else if (innerActive && !outerActive) {
         doorState = DOOR_INNER_FIRST;
+        stateEntryTime = now;
         eventFired = false;
-        Serial.println("Inner row triggered first (potential exit)");
+        Serial.println("[SM] Inner first → potential EXIT");
       }
       else if (outerActive && innerActive) {
-        // Both rows triggered simultaneously – very fast traversal.
-        // Default to entry (more common case).
-        doorState = DOOR_OUTER_FIRST;
+        // Both rows triggered simultaneously – fast traversal.
+        // Use the earlier timestamp to infer which row was actually first.
+        if (outerFirstActiveTime <= innerFirstActiveTime) {
+          doorState = DOOR_OUTER_FIRST;
+          Serial.println("[SM] Simultaneous, outer slightly earlier → ENTRY");
+        } else {
+          doorState = DOOR_INNER_FIRST;
+          Serial.println("[SM] Simultaneous, inner slightly earlier → EXIT");
+        }
+        stateEntryTime = now;
         eventFired = false;
-        Serial.println("Both rows triggered simultaneously (assuming entry)");
       }
       break;
-      
+
     case DOOR_OUTER_FIRST:
       // Waiting for inner row to confirm entry
       if (innerActive && !eventFired) {
-        // Person crossed from outer to inner → ENTRY
         countEvent(1, estimateGroupSize(dist));
         eventFired = true;
       }
+      // Partial-entry timeout: person walked into frame but never crossed
+      if (!eventFired && (now - stateEntryTime > PARTIAL_TIMEOUT)) {
+        Serial.println("[SM] Partial entry timeout – resetting");
+        doorState = DOOR_IDLE;
+        eventFired = false;
+      }
       break;
-      
+
     case DOOR_INNER_FIRST:
       // Waiting for outer row to confirm exit
       if (outerActive && !eventFired) {
-        // Person crossed from inner to outer → EXIT
         countEvent(-1, estimateGroupSize(dist));
         eventFired = true;
       }
+      // Partial-exit timeout
+      if (!eventFired && (now - stateEntryTime > PARTIAL_TIMEOUT)) {
+        Serial.println("[SM] Partial exit timeout – resetting");
+        doorState = DOOR_IDLE;
+        eventFired = false;
+      }
       break;
   }
-  
-  // After event fires and both rows clear, reset to IDLE
-  if (eventFired && !outerActive && !innerActive) {
-    doorState = DOOR_IDLE;
-    eventFired = false;
+
+  // ---- Re-arm for tailgating / back-to-back people ----
+  // After an event has been counted, we don't need to wait for BOTH rows
+  // to fully clear.  As soon as the first-triggered row clears, the
+  // traversal is complete and we can re-arm immediately.  If the other
+  // row is still blocked, that's the next person – so seed the state
+  // machine in the right direction.
+  if (eventFired) {
+    bool firstRowCleared = false;
+    if (doorState == DOOR_OUTER_FIRST) firstRowCleared = !outerActive;
+    if (doorState == DOOR_INNER_FIRST) firstRowCleared = !innerActive;
+
+    if (firstRowCleared) {
+      // Check if the OTHER row is still active (next person already there)
+      if (doorState == DOOR_OUTER_FIRST && innerActive) {
+        // Inner still blocked → next person is starting an EXIT
+        doorState = DOOR_INNER_FIRST;
+        stateEntryTime = now;
+        eventFired = false;
+        Serial.println("[SM] Re-armed: inner still active → potential EXIT (tailgate)");
+      } else if (doorState == DOOR_INNER_FIRST && outerActive) {
+        // Outer still blocked → next person is starting an ENTRY
+        doorState = DOOR_OUTER_FIRST;
+        stateEntryTime = now;
+        eventFired = false;
+        Serial.println("[SM] Re-armed: outer still active → potential ENTRY (tailgate)");
+      } else {
+        // Both rows clear – simple reset
+        doorState = DOOR_IDLE;
+        eventFired = false;
+      }
+    }
   }
 }
 
@@ -274,19 +385,23 @@ int estimateGroupSize(uint16_t dist[4]) {
 // Record an event (direction: +1 entry, -1 exit) with given group size
 void countEvent(int direction, int group) {
   unsigned long now = millis();
-  
-  // Single‑file detection: if same direction within window, add extra
-  if (lastDirection == direction && (now - lastEventTime) < SINGLE_FILE_WINDOW) {
-    peopleCount += direction * group;
-    Serial.printf("Single‑file %s: %+d (extra)\n", (direction==1?"entry":"exit"), direction*group);
-  } else {
-    peopleCount += direction * group;
-    Serial.printf("%s: %+d\n", (direction==1?"Entry":"Exit"), direction*group);
+
+  // Cooldown guard: if the exact same direction fires again faster than
+  // COOLDOWN_MS it is almost certainly the SAME person still being
+  // tracked (not a new person).  Suppress the duplicate.
+  if (lastDirection == direction && (now - lastEventTime) < COOLDOWN_MS) {
+    Serial.printf("[COUNT] Suppressed duplicate %s within cooldown\n",
+                  (direction == 1 ? "entry" : "exit"));
+    return;
   }
-  
+
+  peopleCount += direction * group;
   if (peopleCount < 0) peopleCount = 0;
-  Serial.printf("Total people inside: %d\n", peopleCount);
-  
+
+  Serial.printf("[COUNT] %s %+d  |  Total inside: %d\n",
+                (direction == 1 ? "ENTRY" : "EXIT"),
+                direction * group, peopleCount);
+
   lastDirection = direction;
   lastEventTime = now;
 }
