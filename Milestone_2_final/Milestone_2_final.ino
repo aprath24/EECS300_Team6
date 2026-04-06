@@ -4,25 +4,12 @@
 #include "WirelessCommunication.h"
 #include "sharedVariable.h"
 #include "Preferences.h"
+#include "config.h"
 
-#define BUTTON_PIN 0
-
-// ========== Sensor Configuration ==========
-// Four sensors: Left Inner (LI), Left Outer (LO), Right Inner (RI), Right Outer (RO)
-const uint8_t xshutPins[4] = {18, 16, 17, 19};  // assign any free GPIOs
+// ========== Object Declarations ==========
 VL53L1X sensorsL1[4];   // VL53L1X sensor objects
 VL53L0X sensorsL0[4];   // VL53L0X sensor objects (fallback)
 bool useL1X = true;      // true = using L1X, false = using L0X (set during init)
-enum { LI = 0, LO = 1, RI = 2, RO = 3 };
-
-// Distance thresholds (mm) – tune for your doorway width
-const uint16_t NEAR_THRESH = 400;   // 0-400 mm = near zone
-const uint16_t MID_THRESH  = 800;   // 400-800 mm = mid zone
-const uint16_t FAR_THRESH  = 1200;  // 800-1200 mm = far zone; >1200 = no detection
-
-// Detection threshold – any reading below this means someone is in the doorway
-// (each sensor's near/mid/far zones are all below this cutoff)
-const uint16_t DETECT_THRESH = FAR_THRESH;  // 1200 mm
 
 // ========== Global Variables ==========
 volatile int32_t peopleCount = 0;
@@ -48,26 +35,21 @@ unsigned long innerFirstActiveTime = 0;
 bool outerWasActive = false;  // previous-loop state for edge detection
 bool innerWasActive = false;
 
-// Debounce: a row must stay active for this many ms to count as a real trigger
-const unsigned long DEBOUNCE_MS = 40;
+// Debounce: passed debounce flags
 unsigned long outerDebounceStart = 0;
 unsigned long innerDebounceStart = 0;
 bool outerConfirmed = false;  // passed debounce
 bool innerConfirmed = false;
 
-// Partial-entry timeout: if only one row triggers and the second never does,
-// reset after this window (person peeked in / walked into frame and backed out)
-const unsigned long PARTIAL_TIMEOUT = 1500; // ms
+// Partial-entry timeout: state management
 unsigned long stateEntryTime = 0;  // when we entered OUTER_FIRST or INNER_FIRST
 
-// For single-file / tailgating detection
+// For single-file / tailgating detection logic
 unsigned long lastEventTime = 0;
 int lastDirection = 0;       // 1=entry, -1=exit
-const unsigned long COOLDOWN_MS = 300; // min time between two same-direction events
 
-// Inactivity tracking
+// Inactivity tracking variables
 unsigned long lastActiveTime = 0;
-const unsigned long INACTIVITY_TIMEOUT = 1500; // ms – longer to avoid premature resets
 
 // ========== Function Prototypes ==========
 void initSensors();
