@@ -25,15 +25,20 @@ volatile int32_t peopleCount = 0;
 volatile shared_uint32 x;
 Preferences nonVol;
 
-// State machines for left and right sides
+// Unified state machine for person tracking
 enum SideState { STATE_OUTSIDE, STATE_FAR, STATE_MID, STATE_NEAR };
-SideState leftState = STATE_OUTSIDE;
-SideState rightState = STATE_OUTSIDE;
+SideState trackState = STATE_OUTSIDE;
+int moveDirection = 0;        // 1=entering (from far), -1=exiting (from near), 0=unknown
+bool eventFired = false;      // has an entry/exit been counted this traversal?
 
-// For single‑file detection
+// For single-file detection
 unsigned long lastEventTime = 0;
 int lastDirection = 0;       // 1=entry, -1=exit
 const unsigned long SINGLE_FILE_WINDOW = 500; // ms
+
+// Inactivity tracking
+unsigned long lastActiveTime = 0;
+const unsigned long INACTIVITY_TIMEOUT = 1000; // ms
 
 // For debouncing zone transitions
 unsigned long lastZoneChange = 0;
@@ -153,75 +158,104 @@ Zone getZone(float avgLeft, float avgRight) {
 }
 
 // ========== Counting State Machine ==========
+// Uses direction tracking: first appearance at FAR/MID = entering,
+// first appearance at NEAR = exiting. Events fire only when
+// the person completes the traversal in their initial direction.
 void updateCounting(Zone zone) {
-  // Debounce: ignore rapid changes within 100 ms
+  // Debounce: ignore rapid zone changes within DEBOUNCE_MS
   static Zone lastZone = ZONE_NONE;
-  if (zone == lastZone) {
+  if (zone != lastZone) {
+    if (millis() - lastZoneChange < DEBOUNCE_MS) return;
+    lastZoneChange = millis();
     lastZone = zone;
-    return;
   }
-  if (millis() - lastZoneChange < DEBOUNCE_MS) return;
-  lastZoneChange = millis();
-  lastZone = zone;
   
-  // Extract side and level from zone
-  int side = 0;   // 0=none, 1=left, 2=right
-  int level = 0;  // 0=none, 1=far, 2=mid, 3=near
+  // Extract level from zone: 0=none, 1=far, 2=mid, 3=near
+  int level = 0;
   switch (zone) {
-    case LEFT_FAR:  side=1; level=1; break;
-    case LEFT_MID:  side=1; level=2; break;
-    case LEFT_NEAR: side=1; level=3; break;
-    case RIGHT_FAR: side=2; level=1; break;
-    case RIGHT_MID: side=2; level=2; break;
-    case RIGHT_NEAR:side=2; level=3; break;
-    default: side=0; level=0;
+    case LEFT_FAR:  case RIGHT_FAR:  level = 1; break;
+    case LEFT_MID:  case RIGHT_MID:  level = 2; break;
+    case LEFT_NEAR: case RIGHT_NEAR: level = 3; break;
+    default: level = 0;
   }
   
-  if (side == 0) {
-    // No zone – reset states after 1 second of inactivity
-    static unsigned long lastActive = millis();
-    if (millis() - lastActive > 1000) {
-      leftState = STATE_OUTSIDE;
-      rightState = STATE_OUTSIDE;
+  // ---- Handle no detection (ZONE_NONE) ----
+  if (level == 0) {
+    if (millis() - lastActiveTime > INACTIVITY_TIMEOUT) {
+      // Finalize pending fast exit: person was exiting and reached
+      // at least MID but we missed FAR (walked out very quickly)
+      if (moveDirection == -1 && !eventFired &&
+          (trackState == STATE_MID || trackState == STATE_FAR)) {
+        countEvent(-1, 1);
+      }
+      // Reset state for next person
+      trackState = STATE_OUTSIDE;
+      moveDirection = 0;
+      eventFired = false;
     }
     return;
   }
   
-  // Update last activity timestamp
-  static unsigned long lastActive = millis();
-  lastActive = millis();
+  lastActiveTime = millis();
   
-  SideState *state = (side == 1) ? &leftState : &rightState;
-  
-  // State transition logic
-  if (*state == STATE_OUTSIDE) {
-    if (level == 1) *state = STATE_FAR;
-    else if (level == 2) *state = STATE_MID;
-    else if (level == 3) *state = STATE_NEAR; // person appears very close (started inside)
-  }
-  else if (*state == STATE_FAR) {
-    if (level == 2) *state = STATE_MID;
-    else if (level == 3) {
-      *state = STATE_NEAR;
-      // Reached near from far → entry event
-      countEvent(1, estimateGroupSize());   // 1 = entry
-    }
-    else if (level == 1) { /* still far, do nothing */ }
-  }
-  else if (*state == STATE_MID) {
+  // ---- State machine transitions ----
+  if (trackState == STATE_OUTSIDE) {
+    // First detection: determine direction from which zone appeared
+    eventFired = false;
     if (level == 3) {
-      *state = STATE_NEAR;
-      countEvent(1, estimateGroupSize());   // entry
-    }
-    else if (level == 1) {
-      *state = STATE_FAR;   // moving back out
+      trackState = STATE_NEAR;
+      moveDirection = -1;  // appeared at NEAR → exiting (came from inside)
+    } else if (level == 2) {
+      trackState = STATE_MID;
+      moveDirection = 1;   // appeared at MID → entering
+    } else {
+      trackState = STATE_FAR;
+      moveDirection = 1;   // appeared at FAR → entering
     }
   }
-  else if (*state == STATE_NEAR) {
-    if (level == 2) *state = STATE_MID;
+  else if (trackState == STATE_FAR) {
+    if (level == 2) {
+      trackState = STATE_MID;
+    }
+    else if (level == 3) {
+      trackState = STATE_NEAR;
+      // Entering direction reached NEAR → count entry
+      if (moveDirection == 1 && !eventFired) {
+        countEvent(1, estimateGroupSize());
+        eventFired = true;
+      }
+    }
+    // level==1: still at FAR, no change needed
+  }
+  else if (trackState == STATE_MID) {
+    if (level == 3) {
+      trackState = STATE_NEAR;
+      // Entering direction reached NEAR → count entry
+      if (moveDirection == 1 && !eventFired) {
+        countEvent(1, estimateGroupSize());
+        eventFired = true;
+      }
+    }
     else if (level == 1) {
-      *state = STATE_FAR;
-      countEvent(-1, estimateGroupSize());  // exit
+      trackState = STATE_FAR;
+      // Exiting direction reached FAR → count exit
+      if (moveDirection == -1 && !eventFired) {
+        countEvent(-1, estimateGroupSize());
+        eventFired = true;
+      }
+    }
+  }
+  else if (trackState == STATE_NEAR) {
+    if (level == 2) {
+      trackState = STATE_MID;
+    }
+    else if (level == 1) {
+      trackState = STATE_FAR;
+      // Exiting direction reached FAR → count exit
+      if (moveDirection == -1 && !eventFired) {
+        countEvent(-1, estimateGroupSize());
+        eventFired = true;
+      }
     }
   }
 }
