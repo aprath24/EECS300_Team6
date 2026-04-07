@@ -5,16 +5,17 @@
 
 // ========== Pin Configuration ==========
 #define BUTTON_PIN 0
-const uint8_t xshutPins[4] = {18, 16, 17, 19};  // assign any free GPIOs
+const uint8_t xshutPins[4] = {18, 19, 16, 17};  // assign any free GPIOs
 
 // Sensor index aliases
 enum { LI = 0, LO = 1, RI = 2, RO = 3 };
 
 // ========== Distance Thresholds (mm) ==========
+// Support for VL53L1X, VL53L1CX, and VL53L0X
 // Tune these for your specific doorway width
-const uint16_t NEAR_THRESH   = 400;   // 0-400 mm = near zone
-const uint16_t MID_THRESH    = 800;   // 400-800 mm = mid zone
-const uint16_t FAR_THRESH    = 1200;  // 800-1200 mm = far zone; >1200 = no detection
+const uint16_t NEAR_THRESH   = 200;   // 0-400 mm = near zone
+const uint16_t MID_THRESH    = 400;   // 400-800 mm = mid zone
+const uint16_t FAR_THRESH    = 800;  // 800-1200 mm = far zone; >1200 = no detection
 
 // Any reading below this threshold is considered a detection
 const uint16_t DETECT_THRESH = FAR_THRESH;
