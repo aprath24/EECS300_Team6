@@ -59,6 +59,7 @@ unsigned long stateEntryTime = 0;  // when we entered OUTER_FIRST or INNER_FIRST
 // For single-file / tailgating detection logic
 unsigned long lastEventTime = 0;
 int lastDirection = 0;       // 1=entry, -1=exit
+int peakGroupSiz = 1
 
 // Inactivity tracking variables
 unsigned long lastActiveTime = 0;
@@ -391,50 +392,62 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
       break;
 
     case DOOR_BOTH_ACTIVE: {
-      bool outerWasFirst = (outerFirstActiveTime <= innerFirstActiveTime);
+  // Track peak group size throughout this state (not just at moment of clearing)
+  int currentGroup = estimateGroupSize(dist);
+  if (currentGroup > peakGroupSize) peakGroupSize = currentGroup;
 
-      if (!outerActive && !innerActive) {
-        Serial.println("[SM] Both cleared simultaneously -> counting");
-        countEvent(outerWasFirst ? 1 : -1, estimateGroupSize(dist));
-        doorState = DOOR_IDLE;
-        eventFired = false;
+  bool outerWasFirst = (outerFirstActiveTime <= innerFirstActiveTime);
+  unsigned long timeDiff = (outerFirstActiveTime > innerFirstActiveTime)
+      ? outerFirstActiveTime - innerFirstActiveTime
+      : innerFirstActiveTime - outerFirstActiveTime;
+  bool isCrossing = (timeDiff < SIMULTANEOUS_THRESH_MS);
 
-      } else if (!outerActive && innerActive) {
-        if (outerWasFirst) {
-          Serial.println("[SM] Outer cleared first (was first) -> ENTRY counted");
-          countEvent(1, estimateGroupSize(dist));
-          doorState = DOOR_INNER_FIRST;
-          stateEntryTime = now;
-          eventFired = false;
-          Serial.println("[SM] Re-armed: inner still active -> potential EXIT (tailgate)");
-        } else {
-          Serial.println("[SM] Outer cleared first (was second) -> turned back, NO COUNT");
-          doorState = DOOR_INNER_FIRST;
-          stateEntryTime = now;
-          eventFired = false;
-          Serial.println("[SM] Re-armed: inner still active after turn-back");
-        }
-
-      } else if (!innerActive && outerActive) {
-        if (!outerWasFirst) {
-          Serial.println("[SM] Inner cleared first (was first) -> EXIT counted");
-          countEvent(-1, estimateGroupSize(dist));
-          doorState = DOOR_OUTER_FIRST;
-          stateEntryTime = now;
-          eventFired = false;
-          Serial.println("[SM] Re-armed: outer still active -> potential ENTRY (tailgate)");
-        } else {
-          Serial.println("[SM] Inner cleared first (was second) -> turned back, NO COUNT");
-          doorState = DOOR_OUTER_FIRST;
-          stateEntryTime = now;
-          eventFired = false;
-          Serial.println("[SM] Re-armed: outer still active after turn-back");
-        }
-      }
-      // if both still active, keep waiting
-      break;
+  if (!outerActive && !innerActive) {
+    // ── Both beams cleared ──────────────────────────────────────────
+    if (isCrossing) {
+      Serial.println("[SM] Simultaneous crossing detected -> net 0, no count");
+      // Uncomment below if you want gross traffic stats:
+      // countEvent(1, 1); countEvent(-1, 1);
+    } else {
+      Serial.println("[SM] Both cleared -> counting");
+      countEvent(outerWasFirst ? 1 : -1, peakGroupSize);
     }
+    doorState = DOOR_IDLE;
+    eventFired = false;
+
+  } else if (!outerActive && innerActive) {
+    // ── Outer cleared first ─────────────────────────────────────────
+    if (outerWasFirst) {
+      Serial.println("[SM] Outer cleared first (was first) -> ENTRY counted");
+      countEvent(1, peakGroupSize);
+      Serial.println("[SM] Re-armed: inner still active -> potential EXIT (tailgate)");
+    } else {
+      Serial.println("[SM] Outer cleared first (was second) -> turned back, NO COUNT");
+      Serial.println("[SM] Re-armed: inner still active after turn-back");
+    }
+    peakGroupSize = 1;  // reset for next traversal
+    doorState = DOOR_INNER_FIRST;
+    stateEntryTime = now;
+    eventFired = false;
+
+  } else if (!innerActive && outerActive) {
+    // ── Inner cleared first ─────────────────────────────────────────
+    if (!outerWasFirst) {
+      Serial.println("[SM] Inner cleared first (was first) -> EXIT counted");
+      countEvent(-1, peakGroupSize);
+      Serial.println("[SM] Re-armed: outer still active -> potential ENTRY (tailgate)");
+    } else {
+      Serial.println("[SM] Inner cleared first (was second) -> turned back, NO COUNT");
+      Serial.println("[SM] Re-armed: outer still active after turn-back");
+    }
+    peakGroupSize = 1;  // reset for next traversal
+    doorState = DOOR_OUTER_FIRST;
+    stateEntryTime = now;
+    eventFired = false;
   }
+  // if both still active, keep waiting
+  break;
+}
 }
 // Estimate group size (1 or 2) by checking if both left and right
 // sensors on the active row detect someone within NEAR_THRESH
