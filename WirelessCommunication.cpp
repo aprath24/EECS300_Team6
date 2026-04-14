@@ -1,8 +1,8 @@
 #include "WirelessCommunication.h"
 
 //WiFi name and password, change the name to match your team, and choose your own password
-#define STASSID "team12"
-#define STAPSK "12121212"
+#define STASSID "team0000"
+#define STAPSK "testPassword"
 
 //uncomment following line to enable the debug outpus associated with wifi stuff over serial
 //#define ENABLE_SERIAL_DEBUG_OUTPUTS
@@ -138,8 +138,7 @@ static void handle_reboot_request(WiFiClient &client)
     #ifdef ENABLE_SERIAL_DEBUG_OUTPUTS
       Serial.println("Rebooting");
     #endif
-     
-  //
+      
   ESP.restart();
   }
 }
