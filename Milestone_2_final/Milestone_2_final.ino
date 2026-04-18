@@ -329,7 +329,9 @@ void updateDebouncedRows(bool outerRaw, bool innerRaw) {
 //   • Partial entry then reversal → no count
 //   • Partial exit then reversal  → no count
 //   • Off-center walk (only one sensor per row triggers)
-//   • Tailgating: re-arms when one beam clears while other stays blocked
+//   • Tailgating: re-arms when one beam clears while other stays blocked.
+//     REVERSE_GUARD_MS in countEvent() suppresses the false reverse-direction
+//     event that the re-arm produces, so both tailgaters count correctly.
 void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
   updateDebouncedRows(outerRaw, innerRaw);
 
@@ -469,12 +471,23 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
 // Record an event (direction: +1 entry, -1 exit)
 void countEvent(int direction) {
   unsigned long now = millis();
+  unsigned long elapsed = now - lastEventTime;
 
   // Cooldown guard: suppress duplicate same-direction events that fire
   // faster than COOLDOWN_MS (same person still being tracked)
-  if (lastDirection == direction && (now - lastEventTime) < COOLDOWN_MS) {
+  if (lastDirection == direction && elapsed < COOLDOWN_MS) {
     Serial.printf("[COUNT] Suppressed duplicate %s within cooldown\n",
                   (direction == 1 ? "entry" : "exit"));
+    return;
+  }
+
+  // Reverse guard: suppress opposite-direction events within REVERSE_GUARD_MS.
+  // During tailgating, the re-arm creates a false reverse-direction event
+  // when person A's lingering beam clears. This guard blocks it while
+  // still allowing person B's real same-direction event through later.
+  if (lastDirection != 0 && lastDirection == -direction && elapsed < REVERSE_GUARD_MS) {
+    Serial.printf("[COUNT] Suppressed reverse %s (tailgate guard, %lums since last)\n",
+                  (direction == 1 ? "entry" : "exit"), elapsed);
     return;
   }
 
