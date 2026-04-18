@@ -39,12 +39,6 @@ const unsigned long COOLDOWN_MS = 300;
 // Fully reset the state machine when nobody is detected for this long
 const unsigned long INACTIVITY_TIMEOUT = 1500;
 
-// After counting an event, suppress the OPPOSITE direction for this window.
-// Prevents false reverse-counts from re-arm artifacts during tailgating.
-// (e.g. person A's lingering inner beam being misread as start of EXIT
-//  while person B is actually entering right behind them)
-const unsigned long REVERSE_GUARD_MS = 500;
-
 
 
 #endif // CONFIG_H
