@@ -39,9 +39,6 @@ const unsigned long COOLDOWN_MS = 300;
 // Fully reset the state machine when nobody is detected for this long
 const unsigned long INACTIVITY_TIMEOUT = 1500;
 
-// Two beams activating within this window are treated as a simultaneous
-// crossing (one entering, one exiting) → net 0, no count.
-// Tune by logging raw timeDiff values for your typical door-crossing speed.
-const unsigned long SIMULTANEOUS_THRESH_MS = 80;
+
 
 #endif // CONFIG_H

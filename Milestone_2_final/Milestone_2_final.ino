@@ -30,13 +30,13 @@ Preferences nonVol;
 // Dual-beam state machine for direction detection
 //   Outer row = LO, RO  (hallway side of door frame)
 //   Inner row = LI, RI  (room side of door frame)
-//   Entry: outer triggers first, then inner confirms
-//   Exit:  inner triggers first, then outer confirms
+//   Entry: outer triggers first, then inner confirms  → +1
+//   Exit:  inner triggers first, then outer confirms  → -1
 enum DoorState {
   DOOR_IDLE,          // Nobody detected
   DOOR_OUTER_FIRST,   // Outer row triggered first → potential entry
-  DOOR_INNER_FIRST,    // Inner row triggered first → potential exit
-  DOOR_BOTH_ACTIVE
+  DOOR_INNER_FIRST,   // Inner row triggered first → potential exit
+  DOOR_BOTH_ACTIVE    // Both rows active, waiting for resolution
 };
 DoorState doorState = DOOR_IDLE;
 
@@ -49,30 +49,23 @@ const char* doorStateStr(DoorState s) {
     default:               return "???";
   }
 }
-bool eventFired = false;      // has an entry/exit been counted this traversal?
-
-// Timestamps for when each row first became active in this cycle
-unsigned long outerFirstActiveTime = 0;
-unsigned long innerFirstActiveTime = 0;
-bool outerWasActive = false;  // previous-loop state for edge detection
-bool innerWasActive = false;
 
 // Debounce: passed debounce flags
 unsigned long outerDebounceStart = 0;
 unsigned long innerDebounceStart = 0;
-bool outerConfirmed = false;  // passed debounce
+bool outerConfirmed = false;
 bool innerConfirmed = false;
 
-// Partial-entry timeout: state management
-unsigned long stateEntryTime = 0;  // when we entered OUTER_FIRST or INNER_FIRST
+// State machine timing
+unsigned long stateEntryTime  = 0;   // when we entered current non-IDLE state
+unsigned long lastActiveTime  = 0;   // last time any beam was active
 
-// For single-file / tailgating detection logic
+// Direction tracking: set when entering BOTH_ACTIVE
+bool outerWasFirst = false;
+
+// Cooldown: prevent double-counts for the same person
 unsigned long lastEventTime = 0;
-int lastDirection = 0;       // 1=entry, -1=exit
-int peakGroupSize = 1;
-
-// Inactivity tracking variables
-unsigned long lastActiveTime = 0;
+int lastDirection = 0;   // 1=entry, -1=exit
 
 // ========== Function Prototypes ==========
 void initSensors();
@@ -81,8 +74,7 @@ bool isOuterRowActive(uint16_t dist[4]);
 bool isInnerRowActive(uint16_t dist[4]);
 void updateDebouncedRows(bool outerRaw, bool innerRaw);
 void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]);
-int estimateGroupSize(uint16_t dist[4]);
-void countEvent(int direction, int group);
+void countEvent(int direction);
 void updateNonVolatile();
 void handleWiFiClient(uint16_t dist[4]);
 
@@ -287,13 +279,13 @@ void readAllDistances(uint16_t dist[4]) {
 // ========== Row Detection ==========
 // A row is "active" when at least one *working* sensor on that row detects a person
 bool isOuterRowActive(uint16_t dist[4]) {
-  return (sensorOK[LO] && dist[LO] < DETECT_THRESH) ||
-         (sensorOK[RO] && dist[RO] < DETECT_THRESH);
+  return (sensorOK[LO] && dist[LO] < DETECT_THRESH && dist[LO] > 50) ||
+         (sensorOK[RO] && dist[RO] < DETECT_THRESH && dist[RO] > 50);
 }
 
 bool isInnerRowActive(uint16_t dist[4]) {
-  return (sensorOK[LI] && dist[LI] < DETECT_THRESH) ||
-         (sensorOK[RI] && dist[RI] < DETECT_THRESH);
+  return (sensorOK[LI] && dist[LI] < DETECT_THRESH && dist[LI] > 50) ||
+         (sensorOK[RI] && dist[RI] < DETECT_THRESH && dist[RI] > 50);
 }
 
 // ========== Debounced Row Detection ==========
@@ -326,190 +318,171 @@ void updateDebouncedRows(bool outerRaw, bool innerRaw) {
 // Direction is determined by which row (outer vs inner) triggers first.
 //   Outer first → person walking IN from hallway  → entry (+1)
 //   Inner first → person walking OUT from room    → exit  (-1)
-// The event is counted when the SECOND row also becomes active,
-// confirming the person has crossed both beams.
 //
-// Edge-case handling:
-//   • Tailgating: after an event fires, the machine re-arms as soon as
-//     the first-triggered row clears (even if the other is still blocked
-//     by the next person).
-//   • Fast traversal: when both rows trigger simultaneously from IDLE,
-//     timestamps are compared to infer direction.
-//   • Door-frame loitering: if only one row ever triggers, the partial-
-//     entry timeout resets the machine without counting.
+// A count is only registered when the person crosses BOTH beams,
+// and the first-triggered beam clears first (confirming forward motion).
+// If the second-triggered beam clears first, the person turned back → no count.
+//
+// Handled cases:
+//   • Normal walk in / out (any speed)
+//   • Fast walk-through (both beams trigger nearly simultaneously)
+//   • Partial entry then reversal → no count
+//   • Partial exit then reversal  → no count
+//   • Off-center walk (only one sensor per row triggers)
+//   • Tailgating: re-arms when one beam clears while other stays blocked
 void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
   updateDebouncedRows(outerRaw, innerRaw);
 
   bool outerActive = outerConfirmed;
   bool innerActive = innerConfirmed;
-  bool anyActive = outerActive || innerActive;
+  bool anyActive   = outerActive || innerActive;
   unsigned long now = millis();
 
-  if (outerActive && !outerWasActive) outerFirstActiveTime = now;
-  if (innerActive && !innerWasActive) innerFirstActiveTime = now;
-  outerWasActive = outerActive;
-  innerWasActive = innerActive;
+  // Track last time anything was active
+  if (anyActive) lastActiveTime = now;
 
-  // Only immediately return on inactivity if we are NOT in the middle of
-  // resolving a crossing. DOOR_BOTH_ACTIVE must still be allowed to process
-  // the case where both beams have just cleared.
+  // Inactivity reset: if nothing detected for a while, go back to IDLE.
+  // Exception: DOOR_BOTH_ACTIVE must continue processing even if both
+  // beams just cleared (both-clear-at-once case).
   if (!anyActive && doorState != DOOR_BOTH_ACTIVE) {
     if (now - lastActiveTime > INACTIVITY_TIMEOUT) {
+      if (doorState != DOOR_IDLE) {
+        Serial.printf("[SM:%s] Inactivity timeout -> IDLE\n", doorStateStr(doorState));
+      }
       doorState = DOOR_IDLE;
-      eventFired = false;
     }
     return;
   }
 
-  if (anyActive) {
-    lastActiveTime = now;
-  }
-
   switch (doorState) {
+
+    // ── IDLE: waiting for someone to break a beam ──────────────────────
     case DOOR_IDLE:
       if (outerActive && !innerActive) {
         doorState = DOOR_OUTER_FIRST;
         stateEntryTime = now;
-        eventFired = false;
         Serial.printf("[SM:%s] Outer first -> potential ENTRY\n", doorStateStr(doorState));
+
       } else if (innerActive && !outerActive) {
         doorState = DOOR_INNER_FIRST;
         stateEntryTime = now;
-        eventFired = false;
         Serial.printf("[SM:%s] Inner first -> potential EXIT\n", doorStateStr(doorState));
+
       } else if (outerActive && innerActive) {
-        doorState = (outerFirstActiveTime <= innerFirstActiveTime)
-                    ? DOOR_OUTER_FIRST
-                    : DOOR_INNER_FIRST;
+        // Fast walk: both triggered in same loop cycle.
+        // We can't know order, default to entry (outer-first).
+        doorState = DOOR_BOTH_ACTIVE;
+        outerWasFirst = true;
         stateEntryTime = now;
-        eventFired = false;
-        Serial.printf("[SM:%s] Simultaneous -> inferred direction\n", doorStateStr(doorState));
-      // if nothing is going on for 5 seconds, reset
-      } else if (!anyActive && (now - stateEntryTime > INACTIVITY_TIMEOUT)) {
-        doorState = DOOR_IDLE;
-        eventFired = false;
-        Serial.printf("[SM:%s] Inactivity timeout - resetting\n", doorStateStr(doorState));
+        Serial.printf("[SM:%s] Both beams at once -> assume ENTRY\n", doorStateStr(doorState));
       }
       break;
 
+    // ── OUTER_FIRST: outer beam broken, waiting for inner ──────────────
     case DOOR_OUTER_FIRST:
       if (innerActive) {
+        // Second beam confirmed → enter BOTH_ACTIVE
         doorState = DOOR_BOTH_ACTIVE;
-        Serial.printf("[SM:%s] Both beams active -> waiting to see which clears first\n", doorStateStr(doorState));
-      } else if (!eventFired && (now - stateEntryTime > PARTIAL_TIMEOUT)) {
-        Serial.printf("[SM:%s] Partial entry timeout - resetting\n", doorStateStr(doorState));
+        outerWasFirst = true;
+        Serial.printf("[SM:%s] Inner now active -> BOTH_ACTIVE\n", doorStateStr(doorState));
+
+      } else if (!outerActive) {
+        // Outer cleared without inner ever triggering → partial, no count
+        Serial.printf("[SM:%s] Outer cleared alone -> partial, no count\n", doorStateStr(doorState));
         doorState = DOOR_IDLE;
-        eventFired = false;
+
+      } else if (now - stateEntryTime > PARTIAL_TIMEOUT) {
+        // Loitering in front of outer beam too long
+        Serial.printf("[SM:%s] Partial entry timeout -> IDLE\n", doorStateStr(doorState));
+        doorState = DOOR_IDLE;
       }
       break;
 
+    // ── INNER_FIRST: inner beam broken, waiting for outer ──────────────
     case DOOR_INNER_FIRST:
       if (outerActive) {
+        // Second beam confirmed → enter BOTH_ACTIVE
         doorState = DOOR_BOTH_ACTIVE;
-        Serial.printf("[SM:%s] Both beams active -> waiting to see which clears first\n", doorStateStr(doorState));
-      } else if (!eventFired && (now - stateEntryTime > PARTIAL_TIMEOUT)) {
-        Serial.printf("[SM:%s] Partial exit timeout - resetting\n", doorStateStr(doorState));
+        outerWasFirst = false;
+        Serial.printf("[SM:%s] Outer now active -> BOTH_ACTIVE\n", doorStateStr(doorState));
+
+      } else if (!innerActive) {
+        // Inner cleared without outer ever triggering → partial, no count
+        Serial.printf("[SM:%s] Inner cleared alone -> partial, no count\n", doorStateStr(doorState));
         doorState = DOOR_IDLE;
-        eventFired = false;
+
+      } else if (now - stateEntryTime > PARTIAL_TIMEOUT) {
+        // Loitering in front of inner beam too long
+        Serial.printf("[SM:%s] Partial exit timeout -> IDLE\n", doorStateStr(doorState));
+        doorState = DOOR_IDLE;
       }
       break;
 
+    // ── BOTH_ACTIVE: both beams broken, waiting for resolution ─────────
     case DOOR_BOTH_ACTIVE: {
-      // Track peak group size throughout this state (not just at moment of clearing)
-      int currentGroup = estimateGroupSize(dist);
-      if (currentGroup > peakGroupSize) peakGroupSize = currentGroup;
-
-      bool outerWasFirst = (outerFirstActiveTime <= innerFirstActiveTime);
-      unsigned long timeDiff = (outerFirstActiveTime > innerFirstActiveTime)
-          ? outerFirstActiveTime - innerFirstActiveTime
-          : innerFirstActiveTime - outerFirstActiveTime;
-      bool isCrossing = (timeDiff < SIMULTANEOUS_THRESH_MS);
 
       if (!outerActive && !innerActive) {
-        // ── Both beams cleared ──────────────────────────────────────────
-        if (isCrossing) {
-          Serial.printf("[SM:%s] Simultaneous crossing detected -> net 0, no count\n", doorStateStr(doorState));
-          // Uncomment below if you want gross traffic stats:
-          // countEvent(1, 1); countEvent(-1, 1);
-        } else {
-          Serial.printf("[SM:%s] Both cleared -> counting\n", doorStateStr(doorState));
-          countEvent(outerWasFirst ? 1 : -1, peakGroupSize);
-        }
+        // ── Both cleared at once ──
+        // Count based on which beam triggered first
+        int dir = outerWasFirst ? 1 : -1;
+        Serial.printf("[SM:%s] Both cleared -> %s\n", doorStateStr(doorState),
+                      dir == 1 ? "ENTRY" : "EXIT");
+        countEvent(dir);
         doorState = DOOR_IDLE;
-        eventFired = false;
 
       } else if (!outerActive && innerActive) {
-        // ── Outer cleared first ─────────────────────────────────────────
+        // ── Outer cleared first ──
         if (outerWasFirst) {
-          Serial.printf("[SM:%s] Outer cleared first (was first) -> ENTRY counted\n", doorStateStr(doorState));
-          countEvent(1, peakGroupSize);
-          Serial.printf("[SM:%s] Re-armed: inner still active -> potential EXIT (tailgate)\n", doorStateStr(doorState));
+          // Outer triggered first AND cleared first → person moved through → ENTRY
+          Serial.printf("[SM:%s] Outer cleared first (was first) -> ENTRY\n", doorStateStr(doorState));
+          countEvent(1);
         } else {
+          // Inner triggered first, but outer (second) cleared first → turned back
           Serial.printf("[SM:%s] Outer cleared first (was second) -> turned back, NO COUNT\n", doorStateStr(doorState));
-          Serial.printf("[SM:%s] Re-armed: inner still active after turn-back\n", doorStateStr(doorState));
         }
-        peakGroupSize = 1;  // reset for next traversal
+        // Re-arm: inner still active → potential new exit
         doorState = DOOR_INNER_FIRST;
         stateEntryTime = now;
-        eventFired = false;
+        Serial.printf("[SM:%s] Re-armed: inner still active\n", doorStateStr(doorState));
 
       } else if (!innerActive && outerActive) {
-        // ── Inner cleared first ─────────────────────────────────────────
+        // ── Inner cleared first ──
         if (!outerWasFirst) {
-          Serial.printf("[SM:%s] Inner cleared first (was first) -> EXIT counted\n", doorStateStr(doorState));
-          countEvent(-1, peakGroupSize);
-          Serial.printf("[SM:%s] Re-armed: outer still active -> potential ENTRY (tailgate)\n", doorStateStr(doorState));
+          // Inner triggered first AND cleared first → person moved through → EXIT
+          Serial.printf("[SM:%s] Inner cleared first (was first) -> EXIT\n", doorStateStr(doorState));
+          countEvent(-1);
         } else {
+          // Outer triggered first, but inner (second) cleared first → turned back
           Serial.printf("[SM:%s] Inner cleared first (was second) -> turned back, NO COUNT\n", doorStateStr(doorState));
-          Serial.printf("[SM:%s] Re-armed: outer still active after turn-back\n", doorStateStr(doorState));
         }
-        peakGroupSize = 1;  // reset for next traversal
+        // Re-arm: outer still active → potential new entry
         doorState = DOOR_OUTER_FIRST;
         stateEntryTime = now;
-        eventFired = false;
+        Serial.printf("[SM:%s] Re-armed: outer still active\n", doorStateStr(doorState));
       }
-      // if both still active, keep waiting
+      // else: both still active → keep waiting
       break;
     }
-}
-}
-
-// Estimate group size (1 or 2) by checking if both left and right
-// sensors on the active row detect someone within NEAR_THRESH
-int estimateGroupSize(uint16_t dist[4]) {
-  // Check both sides of the outer row
-  bool leftOuter = (dist[LO] < NEAR_THRESH);
-  bool rightOuter = (dist[RO] < NEAR_THRESH);
-  
-  // Check both sides of the inner row
-  bool leftInner = (dist[LI] < NEAR_THRESH);
-  bool rightInner = (dist[RI] < NEAR_THRESH);
-  
-  // If both left and right sensors on ANY row are in near zone,
-  // there are likely 2 people side by side
-  if ((leftOuter && rightOuter) || (leftInner && rightInner)) return 2;
-  return 1;
+  }
 }
 
-// Record an event (direction: +1 entry, -1 exit) with given group size
-void countEvent(int direction, int group) {
+// Record an event (direction: +1 entry, -1 exit)
+void countEvent(int direction) {
   unsigned long now = millis();
 
-  // Cooldown guard: if the exact same direction fires again faster than
-  // COOLDOWN_MS it is almost certainly the SAME person still being
-  // tracked (not a new person).  Suppress the duplicate.
+  // Cooldown guard: suppress duplicate same-direction events that fire
+  // faster than COOLDOWN_MS (same person still being tracked)
   if (lastDirection == direction && (now - lastEventTime) < COOLDOWN_MS) {
     Serial.printf("[COUNT] Suppressed duplicate %s within cooldown\n",
                   (direction == 1 ? "entry" : "exit"));
     return;
   }
 
-  peopleCount += direction * group;
+  peopleCount += direction;
   if (peopleCount < 0) peopleCount = 0;
 
-  Serial.printf("[COUNT] %s %+d  |  Total inside: %d\n",
-                (direction == 1 ? "ENTRY" : "EXIT"),
-                direction * group, peopleCount);
+  Serial.printf("[COUNT] %s  |  Total inside: %d\n",
+                (direction == 1 ? "ENTRY +1" : "EXIT -1"), peopleCount);
 
   lastDirection = direction;
   lastEventTime = now;
