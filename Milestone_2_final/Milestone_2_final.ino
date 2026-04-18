@@ -116,9 +116,15 @@ void loop() {
   uint16_t dist[4];
   readAllDistances(dist);
 
-  // Debug: print raw sensor distances every cycle print the cnt update as well
-  Serial.printf("[DBG] LI:%4u  LO:%4u  RI:%4u  RO:%4u mm | Count: %d\n",
-                dist[LI], dist[LO], dist[RI], dist[RO], peopleCount);
+  // Debug: print raw sensor distances only when count changes
+  {
+    static int32_t lastPrintedCount = -1;
+    if (peopleCount != lastPrintedCount) {
+      Serial.printf("[DBG] LI:%4u  LO:%4u  RI:%4u  RO:%4u mm | Count: %d\n",
+                    dist[LI], dist[LO], dist[RI], dist[RO], peopleCount);
+      lastPrintedCount = peopleCount;
+    }
+  }
 
   bool outerActive = isOuterRowActive(dist);
   bool innerActive = isInnerRowActive(dist);
