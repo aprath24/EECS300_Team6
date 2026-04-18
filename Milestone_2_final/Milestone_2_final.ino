@@ -278,6 +278,8 @@ void readAllDistances(uint16_t dist[4]) {
         dist[i] = 2000;
       }
     }
+    // Clamp out-of-range / garbage readings (e.g. 65535 from misaligned sensors)
+    if (dist[i] > DIST_MAX_CAP) dist[i] = DIST_MAX_CAP;
     delay(1);
   }
 }
@@ -382,6 +384,11 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
         stateEntryTime = now;
         eventFired = false;
         Serial.printf("[SM:%s] Simultaneous -> inferred direction\n", doorStateStr(doorState));
+      // if nothing is going on for 5 seconds, reset
+      } else if (!anyActive && (now - stateEntryTime > INACTIVITY_TIMEOUT)) {
+        doorState = DOOR_IDLE;
+        eventFired = false;
+        Serial.printf("[SM:%s] Inactivity timeout - resetting\n", doorStateStr(doorState));
       }
       break;
 
