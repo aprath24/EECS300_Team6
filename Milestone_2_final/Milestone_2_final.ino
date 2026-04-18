@@ -39,6 +39,16 @@ enum DoorState {
   DOOR_BOTH_ACTIVE
 };
 DoorState doorState = DOOR_IDLE;
+
+const char* doorStateStr(DoorState s) {
+  switch (s) {
+    case DOOR_IDLE:        return "IDLE";
+    case DOOR_OUTER_FIRST: return "OUTER_FIRST";
+    case DOOR_INNER_FIRST: return "INNER_FIRST";
+    case DOOR_BOTH_ACTIVE: return "BOTH_ACTIVE";
+    default:               return "???";
+  }
+}
 bool eventFired = false;      // has an entry/exit been counted this traversal?
 
 // Timestamps for when each row first became active in this cycle
@@ -359,28 +369,28 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
         doorState = DOOR_OUTER_FIRST;
         stateEntryTime = now;
         eventFired = false;
-        Serial.println("[SM] Outer first -> potential ENTRY");
+        Serial.printf("[SM:%s] Outer first -> potential ENTRY\n", doorStateStr(doorState));
       } else if (innerActive && !outerActive) {
         doorState = DOOR_INNER_FIRST;
         stateEntryTime = now;
         eventFired = false;
-        Serial.println("[SM] Inner first -> potential EXIT");
+        Serial.printf("[SM:%s] Inner first -> potential EXIT\n", doorStateStr(doorState));
       } else if (outerActive && innerActive) {
         doorState = (outerFirstActiveTime <= innerFirstActiveTime)
                     ? DOOR_OUTER_FIRST
                     : DOOR_INNER_FIRST;
         stateEntryTime = now;
         eventFired = false;
-        Serial.println("[SM] Simultaneous -> inferred direction");
+        Serial.printf("[SM:%s] Simultaneous -> inferred direction\n", doorStateStr(doorState));
       }
       break;
 
     case DOOR_OUTER_FIRST:
       if (innerActive) {
         doorState = DOOR_BOTH_ACTIVE;
-        Serial.println("[SM] Both beams active -> waiting to see which clears first");
+        Serial.printf("[SM:%s] Both beams active -> waiting to see which clears first\n", doorStateStr(doorState));
       } else if (!eventFired && (now - stateEntryTime > PARTIAL_TIMEOUT)) {
-        Serial.println("[SM] Partial entry timeout - resetting");
+        Serial.printf("[SM:%s] Partial entry timeout - resetting\n", doorStateStr(doorState));
         doorState = DOOR_IDLE;
         eventFired = false;
       }
@@ -389,9 +399,9 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
     case DOOR_INNER_FIRST:
       if (outerActive) {
         doorState = DOOR_BOTH_ACTIVE;
-        Serial.println("[SM] Both beams active -> waiting to see which clears first");
+        Serial.printf("[SM:%s] Both beams active -> waiting to see which clears first\n", doorStateStr(doorState));
       } else if (!eventFired && (now - stateEntryTime > PARTIAL_TIMEOUT)) {
-        Serial.println("[SM] Partial exit timeout - resetting");
+        Serial.printf("[SM:%s] Partial exit timeout - resetting\n", doorStateStr(doorState));
         doorState = DOOR_IDLE;
         eventFired = false;
       }
@@ -411,11 +421,11 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
       if (!outerActive && !innerActive) {
         // ── Both beams cleared ──────────────────────────────────────────
         if (isCrossing) {
-          Serial.println("[SM] Simultaneous crossing detected -> net 0, no count");
+          Serial.printf("[SM:%s] Simultaneous crossing detected -> net 0, no count\n", doorStateStr(doorState));
           // Uncomment below if you want gross traffic stats:
           // countEvent(1, 1); countEvent(-1, 1);
         } else {
-          Serial.println("[SM] Both cleared -> counting");
+          Serial.printf("[SM:%s] Both cleared -> counting\n", doorStateStr(doorState));
           countEvent(outerWasFirst ? 1 : -1, peakGroupSize);
         }
         doorState = DOOR_IDLE;
@@ -424,12 +434,12 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
       } else if (!outerActive && innerActive) {
         // ── Outer cleared first ─────────────────────────────────────────
         if (outerWasFirst) {
-          Serial.println("[SM] Outer cleared first (was first) -> ENTRY counted");
+          Serial.printf("[SM:%s] Outer cleared first (was first) -> ENTRY counted\n", doorStateStr(doorState));
           countEvent(1, peakGroupSize);
-          Serial.println("[SM] Re-armed: inner still active -> potential EXIT (tailgate)");
+          Serial.printf("[SM:%s] Re-armed: inner still active -> potential EXIT (tailgate)\n", doorStateStr(doorState));
         } else {
-          Serial.println("[SM] Outer cleared first (was second) -> turned back, NO COUNT");
-          Serial.println("[SM] Re-armed: inner still active after turn-back");
+          Serial.printf("[SM:%s] Outer cleared first (was second) -> turned back, NO COUNT\n", doorStateStr(doorState));
+          Serial.printf("[SM:%s] Re-armed: inner still active after turn-back\n", doorStateStr(doorState));
         }
         peakGroupSize = 1;  // reset for next traversal
         doorState = DOOR_INNER_FIRST;
@@ -439,12 +449,12 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
       } else if (!innerActive && outerActive) {
         // ── Inner cleared first ─────────────────────────────────────────
         if (!outerWasFirst) {
-          Serial.println("[SM] Inner cleared first (was first) -> EXIT counted");
+          Serial.printf("[SM:%s] Inner cleared first (was first) -> EXIT counted\n", doorStateStr(doorState));
           countEvent(-1, peakGroupSize);
-          Serial.println("[SM] Re-armed: outer still active -> potential ENTRY (tailgate)");
+          Serial.printf("[SM:%s] Re-armed: outer still active -> potential ENTRY (tailgate)\n", doorStateStr(doorState));
         } else {
-          Serial.println("[SM] Inner cleared first (was second) -> turned back, NO COUNT");
-          Serial.println("[SM] Re-armed: outer still active after turn-back");
+          Serial.printf("[SM:%s] Inner cleared first (was second) -> turned back, NO COUNT\n", doorStateStr(doorState));
+          Serial.printf("[SM:%s] Re-armed: outer still active after turn-back\n", doorStateStr(doorState));
         }
         peakGroupSize = 1;  // reset for next traversal
         doorState = DOOR_OUTER_FIRST;
