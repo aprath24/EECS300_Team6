@@ -47,13 +47,16 @@ static String read_from_server(WiFiClient &client);
 static void write_to_server(WiFiClient &client, String value);
 
 /*
- * Function:  update_count
+ * Function:  poll_server
  * --------------------
- * updates server with provided count
+ * Polls the server for the current people count.
+ * If do_reset is non-zero, sends "#0" to reset the server count to 0.
+ * Parses and returns the count from the server's response.
  * 
- * count: value to be sent to server
+ * do_reset: if non-zero, resets the server count
+ * returns:  the server's current people count
  */
-static void update_count(uint32_t count);
+static uint32_t poll_server(uint32_t do_reset);
 
 /*
  * Function:  handle_reboot_request

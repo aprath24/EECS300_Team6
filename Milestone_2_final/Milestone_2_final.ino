@@ -106,11 +106,9 @@ void setup() {
   Wire.setTimeOut(100);             // 100ms I2C timeout (ESP32)
   initSensors();
 
+  // 2. Load Non-Volatile Data CORRECTLY
   nonVol.begin("nonVolData", false);
-  peopleCount = 0;
-  nonVol.putUInt("count", 0);
-
-  Serial.println("Layout: LO/RO (outer row) | LI/RI (inner row)");
+  peopleCount = nonVol.getUInt("count", 0); // Get saved count, default to 0
 }
 
 // ========== Main Loop ==========
@@ -524,8 +522,8 @@ void handleWiFiClient(uint16_t dist[4]) {
       case '\0': // empty — just a read request
         break;
       default:
-        Serial.print("[WiFi] Received: ");
-        Serial.println(line);
+        // Serial.print("[WiFi] Received: ");
+        // Serial.println(line);
         break;
     }
 
