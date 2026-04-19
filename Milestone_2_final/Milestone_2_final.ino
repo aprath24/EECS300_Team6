@@ -42,7 +42,7 @@ enum DoorState {
   DOOR_WAIT_CLEAR     // Count just fired — wait for both to clear before re-arming
 };
 
-const char* doorStateStr(DoorState s) {
+const char* doorStateStr(uint8_t s) {
   switch (s) {
     case DOOR_IDLE:        return "IDLE";
     case DOOR_OUTER_FIRST: return "OUTER_FIRST";
@@ -70,6 +70,30 @@ SideSM rightSM = {};
 // Cooldown: prevent double-counts for the same person
 unsigned long lastEventTime = 0;
 int lastDirection = 0;   // 1=entry, -1=exit
+
+// ========== Scenario Tracking (for client OLED debug) ==========
+enum Scenario {
+  SC_IDLE,             // Nothing happening
+  SC_SINGLE_ENTRY,     // One person entering
+  SC_SINGLE_EXIT,      // One person exiting
+  SC_SHOULDER_SAME,    // Two people same direction
+  SC_SHOULDER_OPP,     // Two people opposite directions
+  SC_WHEELCHAIR        // Wide object (both sides triggered together)
+};
+
+volatile Scenario currentScenario = SC_IDLE;
+
+const char* scenarioStr(uint8_t s) {
+  switch (s) {
+    case SC_IDLE:           return "IDLE";
+    case SC_SINGLE_ENTRY:   return "ENTRY";
+    case SC_SINGLE_EXIT:    return "EXIT";
+    case SC_SHOULDER_SAME:  return "SH_SAME";
+    case SC_SHOULDER_OPP:   return "SH_OPP";
+    case SC_WHEELCHAIR:     return "WHEELCHAIR";
+    default:                return "???";
+  }
+}
 
 // ========== Function Prototypes ==========
 void initSensors();
@@ -440,16 +464,62 @@ void updateCounting(uint16_t dist[4]) {
   int rightDir = updateSide(rightSM, roRaw, riRaw, "R");
 
   // Apply count events from both sides.
-  // Each side counts independently, which correctly handles:
-  //   • Two people brushing shoulders same dir: both sides +1 = +2
-  //   • Two people brushing shoulders opposite dir: +1 + -1 = 0
-  //   • Wheelchair + pusher: wheelchair blocks both sides (+2),
-  //     pusher absorbed by WAIT_CLEAR = correct +2 for 2 people
-  //   • Solo wheelchair: +2 (minor over-count, acceptable trade-off)
-  //
-  // We batch both sides into a single net count so the cooldown in
-  // countEvent doesn't suppress the second side's same-direction event.
   int netCount = leftDir + rightDir;
+
+  // --- Update scenario for client OLED debug ---
+  if (netCount == 0 && leftDir == 0 && rightDir == 0) {
+    // No events fired — derive scenario from current SM states
+    bool lActive = (leftSM.state != DOOR_IDLE);
+    bool rActive = (rightSM.state != DOOR_IDLE);
+
+    if (!lActive && !rActive) {
+      currentScenario = SC_IDLE;
+    } else if (lActive && rActive) {
+      // Both sides tracking — could be shoulder-by-shoulder
+      currentScenario = SC_SHOULDER_SAME;
+    } else {
+      // One side tracking — single person
+      DoorState activeState = lActive ? leftSM.state : rightSM.state;
+      if (activeState == DOOR_OUTER_FIRST || 
+          (activeState == DOOR_BOTH_ACTIVE && (lActive ? leftSM.outerWasFirst : rightSM.outerWasFirst))) {
+        currentScenario = SC_SINGLE_ENTRY;
+      } else if (activeState == DOOR_INNER_FIRST ||
+                 (activeState == DOOR_BOTH_ACTIVE && !(lActive ? leftSM.outerWasFirst : rightSM.outerWasFirst))) {
+        currentScenario = SC_SINGLE_EXIT;
+      } else if (activeState == DOOR_WAIT_CLEAR) {
+        // Keep previous scenario (just counted, waiting for clear)
+      }
+    }
+  } else if (leftDir != 0 && rightDir != 0) {
+    // Both sides fired this tick
+    if (leftDir == rightDir) {
+      currentScenario = SC_SHOULDER_SAME;
+    } else {
+      currentScenario = SC_SHOULDER_OPP;
+    }
+  } else if (netCount == 2 || netCount == -2) {
+    currentScenario = SC_WHEELCHAIR;
+  } else if (netCount > 0) {
+    // Check if both sides are active (near range) for shoulder detection
+    bool leftNear  = (dist[LO] < NEAR_THRESH || dist[LI] < NEAR_THRESH);
+    bool rightNear = (dist[RO] < NEAR_THRESH || dist[RI] < NEAR_THRESH);
+    currentScenario = (leftNear && rightNear) ? SC_SHOULDER_SAME : SC_SINGLE_ENTRY;
+  } else if (netCount < 0) {
+    bool leftNear  = (dist[LO] < NEAR_THRESH || dist[LI] < NEAR_THRESH);
+    bool rightNear = (dist[RO] < NEAR_THRESH || dist[RI] < NEAR_THRESH);
+    currentScenario = (leftNear && rightNear) ? SC_SHOULDER_SAME : SC_SINGLE_EXIT;
+  } else {
+    // netCount == 0 but one side fired (opposite directions on different ticks)
+    // Check cross-diagonal pattern
+    bool crossA = (dist[RO] <= NEAR_THRESH && dist[LI] <= NEAR_THRESH &&
+                   dist[RI] <= DETECT_THRESH && dist[LO] <= DETECT_THRESH);
+    bool crossB = (dist[LO] <= NEAR_THRESH && dist[RI] <= NEAR_THRESH &&
+                   dist[LI] <= DETECT_THRESH && dist[RO] <= DETECT_THRESH);
+    if (crossA || crossB) {
+      currentScenario = SC_SHOULDER_OPP;
+    }
+  }
+
   if (netCount != 0) countEvent(netCount);
 }
 
@@ -517,12 +587,13 @@ void handleWiFiClient(uint16_t dist[4]) {
         break;
     }
 
-    // Always respond with the current count + sensor distances + door states
-    // Format: #<count>,<LI>,<LO>,<RI>,<RO>,<leftState>,<rightState>\n
+    // Always respond with: count, sensors, door states, scenario
+    // Format: #<count>,<LI>,<LO>,<RI>,<RO>,<leftState>,<rightState>,<scenario>\n
     String response = "#" + String(peopleCount) + ","
                     + String(dist[LI]) + "," + String(dist[LO]) + ","
                     + String(dist[RI]) + "," + String(dist[RO]) + ","
-                    + String((int)leftSM.state) + "," + String((int)rightSM.state) + "\n";
+                    + String((int)leftSM.state) + "," + String((int)rightSM.state) + ","
+                    + String((int)currentScenario) + "\n";
     client.print(response);
     client.stop();
   }

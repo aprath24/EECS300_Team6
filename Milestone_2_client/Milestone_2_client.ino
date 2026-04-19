@@ -44,6 +44,18 @@ const char* doorStateStr(uint8_t s) {
   }
 }
 
+const char* scenarioStr(uint8_t s) {
+  switch (s) {
+    case 0:  return "IDLE";
+    case 1:  return "ENTRY";
+    case 2:  return "EXIT";
+    case 3:  return "SH_SAME";
+    case 4:  return "SH_OPP";
+    case 5:  return "WHEELCHAIR";
+    default: return "???";
+  }
+}
+
 void setup()
 {
   pinMode(BUTTON_PIN, INPUT);
@@ -63,6 +75,7 @@ void setup()
   serverData.distLI = 0; serverData.distLO = 0;
   serverData.distRI = 0; serverData.distRO = 0;
   serverData.leftState = 0; serverData.rightState = 0;
+  serverData.scenario = 0;
   serverData.sem = xSemaphoreCreateMutex();
 
   INIT_SHARED_VARIABLE(reset_flag, 0);
@@ -91,20 +104,21 @@ void loop()
   // Read the latest server data from the WiFi core
   uint32_t count;
   uint16_t dLI, dLO, dRI, dRO;
-  uint8_t  lState, rState;
+  uint8_t  lState, rState, scenario;
 
   LOCK_SHARED_VARIABLE(serverData);
-  count  = serverData.count;
-  dLI    = serverData.distLI;
-  dLO    = serverData.distLO;
-  dRI    = serverData.distRI;
-  dRO    = serverData.distRO;
-  lState = serverData.leftState;
-  rState = serverData.rightState;
+  count    = serverData.count;
+  dLI      = serverData.distLI;
+  dLO      = serverData.distLO;
+  dRI      = serverData.distRI;
+  dRO      = serverData.distRO;
+  lState   = serverData.leftState;
+  rState   = serverData.rightState;
+  scenario = serverData.scenario;
   UNLOCK_SHARED_VARIABLE(serverData);
 
   // Update the OLED with debug info
-  update_oled(count, dLI, dLO, dRI, dRO, lState, rState);
+  update_oled(count, dLI, dLO, dRI, dRO, lState, rState, scenario);
   
   // Moderate refresh rate
   delay(100);
@@ -113,35 +127,29 @@ void loop()
 
 void update_oled(uint32_t count, uint16_t dLI, uint16_t dLO,
                  uint16_t dRI, uint16_t dRO,
-                 uint8_t lState, uint8_t rState) {
+                 uint8_t lState, uint8_t rState, uint8_t scenario) {
   display.clearDisplay();
   
-  // Row 0: Header + count (large)
+  // Row 0: Count + Scenario
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.print("COUNT:");
-  display.setTextSize(2);
-  display.setCursor(50, 0);
-  display.print(count);
+  display.printf("CNT:%-3d  %s", count, scenarioStr(scenario));
 
-  // Row 2: Separator
-  display.drawLine(0, 18, 128, 18, SSD1306_WHITE);
+  // Row 1: Separator
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
 
-  // Row 3: Sensor distances
-  display.setTextSize(1);
-  display.setCursor(0, 22);
+  // Row 2-3: Sensor distances
+  display.setCursor(0, 14);
   display.printf("LI:%4u LO:%4u", dLI, dLO);
-  display.setCursor(0, 32);
+  display.setCursor(0, 24);
   display.printf("RI:%4u RO:%4u", dRI, dRO);
 
-  // Row 5: Separator
-  display.drawLine(0, 42, 128, 42, SSD1306_WHITE);
+  // Row 4: Separator
+  display.drawLine(0, 34, 128, 34, SSD1306_WHITE);
 
-  // Row 6-7: Door states
-  display.setCursor(0, 46);
-  display.printf("L: %s", doorStateStr(lState));
-  display.setCursor(0, 56);
-  display.printf("R: %s", doorStateStr(rState));
+  // Row 5-6: Door states side by side
+  display.setCursor(0, 38);
+  display.printf("L:%-9s R:%s", doorStateStr(lState), doorStateStr(rState));
   
   display.display();
 }

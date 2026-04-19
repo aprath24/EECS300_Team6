@@ -146,20 +146,20 @@ static void poll_server(uint32_t do_reset)
     write_to_server(client, "\n");    // empty request = just read
   }
 
-  // Server responds with: "#<count>,<LI>,<LO>,<RI>,<RO>,<leftState>,<rightState>\n"
+  // Server responds with: "#<count>,<LI>,<LO>,<RI>,<RO>,<leftState>,<rightState>,<scenario>\n"
   String response = read_from_server(client);
   client.stop();
 
   // Parse the full response into shared data
   uint32_t count = 0;
   uint16_t dLI = 0, dLO = 0, dRI = 0, dRO = 0;
-  uint8_t  lState = 0, rState = 0;
+  uint8_t  lState = 0, rState = 0, scenario = 0;
 
   if (response.length() > 0 && response[0] == '#') {
-    // Tokenize by commas: count, LI, LO, RI, RO, leftState, rightState
+    // Tokenize by commas: count, LI, LO, RI, RO, leftState, rightState, scenario
     int idx = 1;  // skip '#'
     int field = 0;
-    while (idx <= (int)response.length() && field < 7) {
+    while (idx <= (int)response.length() && field < 8) {
       int nextComma = response.indexOf(',', idx);
       if (nextComma < 0) nextComma = response.length();
       String token = response.substring(idx, nextComma);
@@ -170,7 +170,8 @@ static void poll_server(uint32_t do_reset)
         case 3: dRI    = token.toInt(); break;
         case 4: dRO    = token.toInt(); break;
         case 5: lState = token.toInt(); break;
-        case 6: rState = token.toInt(); break;
+        case 6: rState   = token.toInt(); break;
+        case 7: scenario = token.toInt(); break;
       }
       idx = nextComma + 1;
       field++;
@@ -186,6 +187,7 @@ static void poll_server(uint32_t do_reset)
   serverData.distRO  = dRO;
   serverData.leftState  = lState;
   serverData.rightState = rState;
+  serverData.scenario   = scenario;
   UNLOCK_SHARED_VARIABLE(serverData);
 }
 
