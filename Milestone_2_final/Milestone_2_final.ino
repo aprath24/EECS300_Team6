@@ -67,11 +67,6 @@ struct SideSM {
 SideSM leftSM  = {};   // zero-initialized → DOOR_IDLE, all timers 0
 SideSM rightSM = {};
 
-// Wide-object (wheelchair) detection:
-// A wheelchair (~635mm) blocks BOTH left and right sensors on a row at once.
-// When detected, only the left side produces count events to avoid double-counting.
-bool wideObjectDetected = false;
-
 // Cooldown: prevent double-counts for the same person
 unsigned long lastEventTime = 0;
 int lastDirection = 0;   // 1=entry, -1=exit
@@ -408,13 +403,10 @@ int updateSide(SideSM &sm, bool outerRaw, bool innerRaw, const char* side) {
       break;
 
     case DOOR_WAIT_CLEAR: {
-      unsigned long clearTimeout = wideObjectDetected
-                                 ? WHEELCHAIR_CLEAR_TIMEOUT
-                                 : PARTIAL_TIMEOUT;
       if (!outerActive && !innerActive) {
         Serial.printf("[%s] WAIT_CLEAR -> all clear -> IDLE\n", side);
         sm.state = DOOR_IDLE;
-      } else if (now - sm.stateEntryTime > clearTimeout) {
+      } else if (now - sm.stateEntryTime > PARTIAL_TIMEOUT) {
         Serial.printf("[%s] WAIT_CLEAR timeout -> IDLE\n", side);
         sm.state = DOOR_IDLE;
       }
@@ -443,47 +435,44 @@ void updateCounting(uint16_t dist[4]) {
   bool roRaw = isSensorActive(RO, dist);
   bool riRaw = isSensorActive(RI, dist);
 
-  bool anyActive = loRaw || liRaw || roRaw || riRaw;
-
-  // Wide-object detection: both L+R on the same row simultaneously blocked
-  if (anyActive && ((loRaw && roRaw) || (liRaw && riRaw))) {
-    if (!wideObjectDetected) {
-      Serial.println("[SM] Wide object detected (wheelchair?)");
-    }
-    wideObjectDetected = true;
-  }
-  if (!anyActive) wideObjectDetected = false;
-
-  // Run both side state machines
+  // Run both side state machines independently
   int leftDir  = updateSide(leftSM,  loRaw, liRaw, "L");
   int rightDir = updateSide(rightSM, roRaw, riRaw, "R");
 
-  // Apply count events.
-  // When a wide object is detected, only the left side counts to prevent
-  // double-counting a wheelchair that blocks both L+R sensors.
-  if (leftDir != 0) countEvent(leftDir);
-  if (rightDir != 0 && !wideObjectDetected) countEvent(rightDir);
+  // Apply count events from both sides.
+  // Each side counts independently, which correctly handles:
+  //   • Two people brushing shoulders same dir: both sides +1 = +2
+  //   • Two people brushing shoulders opposite dir: +1 + -1 = 0
+  //   • Wheelchair + pusher: wheelchair blocks both sides (+2),
+  //     pusher absorbed by WAIT_CLEAR = correct +2 for 2 people
+  //   • Solo wheelchair: +2 (minor over-count, acceptable trade-off)
+  //
+  // We batch both sides into a single net count so the cooldown in
+  // countEvent doesn't suppress the second side's same-direction event.
+  int netCount = leftDir + rightDir;
+  if (netCount != 0) countEvent(netCount);
 }
 
-// Record an event (direction: +1 entry, -1 exit)
+// Record an event (direction: +1/+2 entry, -1/-2 exit)
 void countEvent(int direction) {
   unsigned long now = millis();
+  int sign = (direction > 0) ? 1 : -1;
 
   // Cooldown guard: suppress duplicate same-direction events that fire
-  // faster than COOLDOWN_MS (same person still being tracked)
-  if (lastDirection == direction && (now - lastEventTime) < COOLDOWN_MS) {
+  // faster than COOLDOWN_MS (same person still being tracked).
+  // Uses sign (entry vs exit), not magnitude, for comparison.
+  if (lastDirection == sign && (now - lastEventTime) < COOLDOWN_MS) {
     Serial.printf("[COUNT] Suppressed duplicate %s within cooldown\n",
-                  (direction == 1 ? "entry" : "exit"));
+                  (sign == 1 ? "entry" : "exit"));
     return;
   }
 
   peopleCount += direction;
   if (peopleCount < 0) peopleCount = 0;
 
-  Serial.printf("[COUNT] %s  |  Total inside: %d\n",
-                (direction == 1 ? "ENTRY +1" : "EXIT -1"), peopleCount);
+  Serial.printf("[COUNT] %+d  |  Total inside: %d\n", direction, peopleCount);
 
-  lastDirection = direction;
+  lastDirection = sign;
   lastEventTime = now;
 }
 
