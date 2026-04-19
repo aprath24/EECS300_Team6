@@ -36,7 +36,8 @@ enum DoorState {
   DOOR_IDLE,          // Nobody detected
   DOOR_OUTER_FIRST,   // Outer row triggered first → potential entry
   DOOR_INNER_FIRST,   // Inner row triggered first → potential exit
-  DOOR_BOTH_ACTIVE    // Both rows active, waiting for resolution
+  DOOR_BOTH_ACTIVE,   // Both rows active, waiting for resolution
+  DOOR_WAIT_CLEAR     // Count just fired — wait for ALL beams to clear before re-arming
 };
 DoorState doorState = DOOR_IDLE;
 
@@ -46,6 +47,7 @@ const char* doorStateStr(DoorState s) {
     case DOOR_OUTER_FIRST: return "OUTER_FIRST";
     case DOOR_INNER_FIRST: return "INNER_FIRST";
     case DOOR_BOTH_ACTIVE: return "BOTH_ACTIVE";
+    case DOOR_WAIT_CLEAR:  return "WAIT_CLEAR";
     default:               return "???";
   }
 }
@@ -327,7 +329,7 @@ void updateDebouncedRows(bool outerRaw, bool innerRaw) {
 //   • Partial entry then reversal → no count
 //   • Partial exit then reversal  → no count
 //   • Off-center walk (only one sensor per row triggers)
-//   • Tailgating: re-arms when one beam clears while other stays blocked
+//   • Tailgating: after a count, waits for ALL beams to clear before re-arming
 void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
   updateDebouncedRows(outerRaw, innerRaw);
 
@@ -343,6 +345,12 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
   // Exception: DOOR_BOTH_ACTIVE must continue processing even if both
   // beams just cleared (both-clear-at-once case).
   if (!anyActive && doorState != DOOR_BOTH_ACTIVE) {
+    // WAIT_CLEAR: both beams are now clear after a count → go to IDLE
+    if (doorState == DOOR_WAIT_CLEAR) {
+      Serial.printf("[SM:%s] All clear -> IDLE, ready for next person\n", doorStateStr(doorState));
+      doorState = DOOR_IDLE;
+      return;
+    }
     if (now - lastActiveTime > INACTIVITY_TIMEOUT) {
       if (doorState != DOOR_IDLE) {
         Serial.printf("[SM:%s] Inactivity timeout -> IDLE\n", doorStateStr(doorState));
@@ -421,7 +429,6 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
 
       if (!outerActive && !innerActive) {
         // ── Both cleared at once ──
-        // Count based on which beam triggered first
         int dir = outerWasFirst ? 1 : -1;
         Serial.printf("[SM:%s] Both cleared -> %s\n", doorStateStr(doorState),
                       dir == 1 ? "ENTRY" : "EXIT");
@@ -438,10 +445,14 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
           // Inner triggered first, but outer (second) cleared first → turned back
           Serial.printf("[SM:%s] Outer cleared first (was second) -> turned back, NO COUNT\n", doorStateStr(doorState));
         }
-        // Re-arm: inner still active → potential new exit
-        doorState = DOOR_INNER_FIRST;
+        // Wait for ALL beams to clear before re-arming.
+        // Going to IDLE here would immediately re-detect the still-active inner
+        // beam as INNER_FIRST, pre-assigning "exit" for the next person — but
+        // a tailgater is usually walking the SAME direction.  WAIT_CLEAR prevents
+        // the leftover signal from poisoning the next sequence.
+        doorState = DOOR_WAIT_CLEAR;
         stateEntryTime = now;
-        Serial.printf("[SM:%s] Re-armed: inner still active\n", doorStateStr(doorState));
+        Serial.printf("[SM] -> WAIT_CLEAR (inner still active)\n");
 
       } else if (!innerActive && outerActive) {
         // ── Inner cleared first ──
@@ -453,14 +464,31 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
           // Outer triggered first, but inner (second) cleared first → turned back
           Serial.printf("[SM:%s] Inner cleared first (was second) -> turned back, NO COUNT\n", doorStateStr(doorState));
         }
-        // Re-arm: outer still active → potential new entry
-        doorState = DOOR_OUTER_FIRST;
+        // Same reasoning: wait for all clear.
+        doorState = DOOR_WAIT_CLEAR;
         stateEntryTime = now;
-        Serial.printf("[SM:%s] Re-armed: outer still active\n", doorStateStr(doorState));
+        Serial.printf("[SM] -> WAIT_CLEAR (outer still active)\n");
       }
       // else: both still active → keep waiting
       break;
     }
+
+    // ── WAIT_CLEAR: count just fired, wait for doorway to clear ────────
+    //    This prevents a tailgater's residual beam from being misread
+    //    as the first trigger of a new opposite-direction sequence.
+    case DOOR_WAIT_CLEAR:
+      if (!outerActive && !innerActive) {
+        // Doorway fully clear → ready for next person
+        Serial.printf("[SM:%s] All clear -> IDLE\n", doorStateStr(doorState));
+        doorState = DOOR_IDLE;
+      } else if (now - stateEntryTime > PARTIAL_TIMEOUT) {
+        // Safety: if beams stay blocked too long (e.g. object in doorway),
+        // force back to IDLE so we don't get stuck.
+        Serial.printf("[SM:%s] Timeout waiting for clear -> IDLE\n", doorStateStr(doorState));
+        doorState = DOOR_IDLE;
+      }
+      // else: still waiting for beams to clear
+      break;
   }
 }
 
