@@ -519,6 +519,53 @@ void updateCounting(uint16_t dist[4]) {
       currentScenario = SC_SHOULDER_OPP;
     }
   }
+  // --- Shoulder-by-shoulder counting logic ---
+
+  // Cross-diagonal pattern: opposite direction shoulder-by-shoulder.
+  // Pattern A (enter right, exit left): RO<=NEAR && LI<=NEAR && RI<=DETECT && LO<=DETECT
+  // Pattern B (enter left, exit right): LO<=NEAR && RI<=NEAR && LI<=DETECT && RO<=DETECT
+  bool crossA = (dist[RO] <= NEAR_THRESH && dist[LI] <= NEAR_THRESH &&
+                 dist[RI] <= DETECT_THRESH && dist[LO] <= DETECT_THRESH);
+  bool crossB = (dist[LO] <= NEAR_THRESH && dist[RI] <= NEAR_THRESH &&
+                 dist[LI] <= DETECT_THRESH && dist[RO] <= DETECT_THRESH);
+  bool crossDetected = crossA || crossB;
+
+  // Opposite directions: both sides fired on same tick but cancelled (net=0).
+  // Apply each event independently so neither is lost.
+  if (crossDetected && leftDir != 0 && rightDir != 0 && netCount == 0) {
+    Serial.printf("[COUNT] Opposite shoulder-by-shoulder: L=%+d R=%+d\n", leftDir, rightDir);
+    countEvent(leftDir);
+    countEvent(rightDir);
+    return;
+  }
+
+  // Same direction: one side fired, other hasn't resolved yet.
+  // Boost to ±2 and force the non-firing side to WAIT_CLEAR.
+  // SKIP if cross-diagonal detected — that means opposite-direction traversal,
+  // the other event will arrive on a later tick (cooldown won't block it
+  // because the signs are different).
+  if (!crossDetected && (netCount == 1 || netCount == -1)) {
+    bool leftNear  = (dist[LO] < NEAR_THRESH || dist[LI] < NEAR_THRESH);
+    bool rightNear = (dist[RO] < NEAR_THRESH || dist[RI] < NEAR_THRESH);
+
+    if (leftNear && rightNear) {
+      int sign = (netCount > 0) ? 1 : -1;
+      netCount = 2 * sign;
+
+      if (leftDir == 0) {
+        Serial.printf("[L] Shoulder-by-shoulder -> skip, forced WAIT_CLEAR\n");
+        leftSM.state = DOOR_WAIT_CLEAR;
+        leftSM.stateEntryTime = millis();
+      }
+      if (rightDir == 0) {
+        Serial.printf("[R] Shoulder-by-shoulder -> skip, forced WAIT_CLEAR\n");
+        rightSM.state = DOOR_WAIT_CLEAR;
+        rightSM.stateEntryTime = millis();
+      }
+
+      Serial.printf("[COUNT] Shoulder-by-shoulder detected -> boosted to %+d\n", netCount);
+    }
+  }
 
   if (netCount != 0) countEvent(netCount);
 }
