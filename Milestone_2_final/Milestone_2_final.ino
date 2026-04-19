@@ -27,19 +27,20 @@ int  numSensorsOK = 0;   // count of successfully initialized sensors
 volatile int32_t peopleCount = 0;
 Preferences nonVol;
 
-// Dual-beam state machine for direction detection
-//   Outer row = LO, RO  (hallway side of door frame)
-//   Inner row = LI, RI  (room side of door frame)
-//   Entry: outer triggers first, then inner confirms  → +1
-//   Exit:  inner triggers first, then outer confirms  → -1
+// ========== Per-Side State Machine ==========
+// Two independent state machines: one for the LEFT sensor pair (LO, LI)
+// and one for the RIGHT pair (RO, RI).  This lets the system handle:
+//   • Two people passing shoulder-to-shoulder in opposite directions
+//   • Wheelchairs (wide objects block both sides → only one count)
+//   • All the same cases as before (tailgating, partials, etc.)
+
 enum DoorState {
   DOOR_IDLE,          // Nobody detected
-  DOOR_OUTER_FIRST,   // Outer row triggered first → potential entry
-  DOOR_INNER_FIRST,   // Inner row triggered first → potential exit
-  DOOR_BOTH_ACTIVE,   // Both rows active, waiting for resolution
-  DOOR_WAIT_CLEAR     // Count just fired — wait for ALL beams to clear before re-arming
+  DOOR_OUTER_FIRST,   // Outer sensor triggered first → potential entry
+  DOOR_INNER_FIRST,   // Inner sensor triggered first → potential exit
+  DOOR_BOTH_ACTIVE,   // Both sensors active, waiting for resolution
+  DOOR_WAIT_CLEAR     // Count just fired — wait for both to clear before re-arming
 };
-DoorState doorState = DOOR_IDLE;
 
 const char* doorStateStr(DoorState s) {
   switch (s) {
@@ -52,23 +53,23 @@ const char* doorStateStr(DoorState s) {
   }
 }
 
-// Debounce: passed debounce flags
-unsigned long outerDebounceStart = 0;
-unsigned long innerDebounceStart = 0;
-bool outerConfirmed = false;
-bool innerConfirmed = false;
+struct SideSM {
+  DoorState state;
+  unsigned long stateEntryTime;
+  unsigned long lastActiveTime;
+  unsigned long outerDebStart;
+  unsigned long innerDebStart;
+  bool outerConf;
+  bool innerConf;
+  bool outerWasFirst;
+};
 
-// State machine timing
-unsigned long stateEntryTime  = 0;   // when we entered current non-IDLE state
-unsigned long lastActiveTime  = 0;   // last time any beam was active
-
-// Direction tracking: set when entering BOTH_ACTIVE
-bool outerWasFirst = false;
+SideSM leftSM  = {};   // zero-initialized → DOOR_IDLE, all timers 0
+SideSM rightSM = {};
 
 // Wide-object (wheelchair) detection:
 // A wheelchair (~635mm) blocks BOTH left and right sensors on a row at once.
-// A person typically only blocks one.  When detected, WAIT_CLEAR uses a
-// longer timeout so the person pushing behind doesn't get double-counted.
+// When detected, only the left side produces count events to avoid double-counting.
 bool wideObjectDetected = false;
 
 // Cooldown: prevent double-counts for the same person
@@ -78,10 +79,8 @@ int lastDirection = 0;   // 1=entry, -1=exit
 // ========== Function Prototypes ==========
 void initSensors();
 void readAllDistances(uint16_t dist[4]);
-bool isOuterRowActive(uint16_t dist[4]);
-bool isInnerRowActive(uint16_t dist[4]);
-void updateDebouncedRows(bool outerRaw, bool innerRaw);
-void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]);
+int  updateSide(SideSM &sm, bool outerRaw, bool innerRaw, const char* side);
+void updateCounting(uint16_t dist[4]);
 void countEvent(int direction);
 void updateNonVolatile();
 void handleWiFiClient(uint16_t dist[4]);
@@ -134,10 +133,7 @@ void loop() {
     }
   }
 
-  bool outerActive = isOuterRowActive(dist);
-  bool innerActive = isInnerRowActive(dist);
-
-  updateCounting(outerActive, innerActive, dist);
+  updateCounting(dist);
   handleWiFiClient(dist);
   updateNonVolatile();
 
@@ -282,252 +278,191 @@ void readAllDistances(uint16_t dist[4]) {
   }
 }
 
-// ========== Row Detection ==========
-// A row is "active" when at least one *working* sensor on that row detects a person
-bool isOuterRowActive(uint16_t dist[4]) {
-  return (sensorOK[LO] && dist[LO] < DETECT_THRESH && dist[LO] > 50) ||
-         (sensorOK[RO] && dist[RO] < DETECT_THRESH && dist[RO] > 50);
+// ========== Per-Sensor Detection ==========
+bool isSensorActive(int idx, uint16_t dist[4]) {
+  return sensorOK[idx] && dist[idx] < DETECT_THRESH && dist[idx] > 50;
 }
 
-bool isInnerRowActive(uint16_t dist[4]) {
-  return (sensorOK[LI] && dist[LI] < DETECT_THRESH && dist[LI] > 50) ||
-         (sensorOK[RI] && dist[RI] < DETECT_THRESH && dist[RI] > 50);
-}
-
-// ========== Wide-Object (Wheelchair) Detection ==========
-// Returns true if BOTH left and right sensors on either row are simultaneously
-// detecting something.  A wheelchair (~635mm wide) blocks both sensors;
-// a single person typically only blocks one.
-bool isWideObject(uint16_t dist[4]) {
-  bool outerWide = sensorOK[LO] && sensorOK[RO]
-                && dist[LO] < DETECT_THRESH && dist[LO] > 50
-                && dist[RO] < DETECT_THRESH && dist[RO] > 50;
-  bool innerWide = sensorOK[LI] && sensorOK[RI]
-                && dist[LI] < DETECT_THRESH && dist[LI] > 50
-                && dist[RI] < DETECT_THRESH && dist[RI] > 50;
-  return outerWide || innerWide;
-}
-
-// ========== Debounced Row Detection ==========
-// Returns true only if the raw row signal has been continuously active
-// for at least DEBOUNCE_MS.  This filters out momentary noise / reflections
-// that happen when someone brushes the door frame.
-void updateDebouncedRows(bool outerRaw, bool innerRaw) {
+// ========== Per-Side State Machine ==========
+// Runs the direction-detection state machine for one side (left or right).
+// Returns a pending count event: 0 = none, +1 = entry, -1 = exit.
+int updateSide(SideSM &sm, bool outerRaw, bool innerRaw, const char* side) {
   unsigned long now = millis();
 
-  // --- Outer row debounce ---
+  // --- Per-side debounce ---
   if (outerRaw) {
-    if (outerDebounceStart == 0) outerDebounceStart = now;
-    if (now - outerDebounceStart >= DEBOUNCE_MS) outerConfirmed = true;
+    if (sm.outerDebStart == 0) sm.outerDebStart = now;
+    if (now - sm.outerDebStart >= DEBOUNCE_MS) sm.outerConf = true;
   } else {
-    outerDebounceStart = 0;
-    outerConfirmed = false;
+    sm.outerDebStart = 0;
+    sm.outerConf = false;
+  }
+  if (innerRaw) {
+    if (sm.innerDebStart == 0) sm.innerDebStart = now;
+    if (now - sm.innerDebStart >= DEBOUNCE_MS) sm.innerConf = true;
+  } else {
+    sm.innerDebStart = 0;
+    sm.innerConf = false;
   }
 
-  // --- Inner row debounce ---
-  if (innerRaw) {
-    if (innerDebounceStart == 0) innerDebounceStart = now;
-    if (now - innerDebounceStart >= DEBOUNCE_MS) innerConfirmed = true;
-  } else {
-    innerDebounceStart = 0;
-    innerConfirmed = false;
+  bool outerActive = sm.outerConf;
+  bool innerActive = sm.innerConf;
+  bool anyActive   = outerActive || innerActive;
+
+  if (anyActive) sm.lastActiveTime = now;
+
+  int pendingEvent = 0;
+
+  // --- Inactivity / WAIT_CLEAR handling ---
+  if (!anyActive && sm.state != DOOR_BOTH_ACTIVE) {
+    if (sm.state == DOOR_WAIT_CLEAR) {
+      Serial.printf("[%s:%s] All clear -> IDLE\n", side, doorStateStr(sm.state));
+      sm.state = DOOR_IDLE;
+      return 0;
+    }
+    if (now - sm.lastActiveTime > INACTIVITY_TIMEOUT) {
+      if (sm.state != DOOR_IDLE) {
+        Serial.printf("[%s:%s] Inactivity -> IDLE\n", side, doorStateStr(sm.state));
+      }
+      sm.state = DOOR_IDLE;
+    }
+    return 0;
   }
+
+  // --- State machine ---
+  switch (sm.state) {
+
+    case DOOR_IDLE:
+      if (outerActive && !innerActive) {
+        sm.state = DOOR_OUTER_FIRST;
+        sm.stateEntryTime = now;
+        Serial.printf("[%s] Outer first -> potential ENTRY\n", side);
+      } else if (innerActive && !outerActive) {
+        sm.state = DOOR_INNER_FIRST;
+        sm.stateEntryTime = now;
+        Serial.printf("[%s] Inner first -> potential EXIT\n", side);
+      } else if (outerActive && innerActive) {
+        sm.state = DOOR_BOTH_ACTIVE;
+        sm.outerWasFirst = true;
+        sm.stateEntryTime = now;
+        Serial.printf("[%s] Both at once -> assume ENTRY\n", side);
+      }
+      break;
+
+    case DOOR_OUTER_FIRST:
+      if (innerActive) {
+        sm.state = DOOR_BOTH_ACTIVE;
+        sm.outerWasFirst = true;
+        Serial.printf("[%s] Inner now active -> BOTH_ACTIVE\n", side);
+      } else if (!outerActive) {
+        Serial.printf("[%s] Outer cleared alone -> partial\n", side);
+        sm.state = DOOR_IDLE;
+      } else if (now - sm.stateEntryTime > PARTIAL_TIMEOUT) {
+        Serial.printf("[%s] Partial timeout -> IDLE\n", side);
+        sm.state = DOOR_IDLE;
+      }
+      break;
+
+    case DOOR_INNER_FIRST:
+      if (outerActive) {
+        sm.state = DOOR_BOTH_ACTIVE;
+        sm.outerWasFirst = false;
+        Serial.printf("[%s] Outer now active -> BOTH_ACTIVE\n", side);
+      } else if (!innerActive) {
+        Serial.printf("[%s] Inner cleared alone -> partial\n", side);
+        sm.state = DOOR_IDLE;
+      } else if (now - sm.stateEntryTime > PARTIAL_TIMEOUT) {
+        Serial.printf("[%s] Partial timeout -> IDLE\n", side);
+        sm.state = DOOR_IDLE;
+      }
+      break;
+
+    case DOOR_BOTH_ACTIVE:
+      if (!outerActive && !innerActive) {
+        pendingEvent = sm.outerWasFirst ? 1 : -1;
+        Serial.printf("[%s] Both cleared -> %s\n", side,
+                      pendingEvent == 1 ? "ENTRY" : "EXIT");
+        sm.state = DOOR_IDLE;
+
+      } else if (!outerActive && innerActive) {
+        if (sm.outerWasFirst) {
+          pendingEvent = 1;
+          Serial.printf("[%s] Outer cleared first (was first) -> ENTRY\n", side);
+        } else {
+          Serial.printf("[%s] Outer cleared first (was second) -> turned back\n", side);
+        }
+        sm.state = DOOR_WAIT_CLEAR;
+        sm.stateEntryTime = now;
+
+      } else if (!innerActive && outerActive) {
+        if (!sm.outerWasFirst) {
+          pendingEvent = -1;
+          Serial.printf("[%s] Inner cleared first (was first) -> EXIT\n", side);
+        } else {
+          Serial.printf("[%s] Inner cleared first (was second) -> turned back\n", side);
+        }
+        sm.state = DOOR_WAIT_CLEAR;
+        sm.stateEntryTime = now;
+      }
+      // else: both still active → keep waiting
+      break;
+
+    case DOOR_WAIT_CLEAR: {
+      unsigned long clearTimeout = wideObjectDetected
+                                 ? WHEELCHAIR_CLEAR_TIMEOUT
+                                 : PARTIAL_TIMEOUT;
+      if (!outerActive && !innerActive) {
+        Serial.printf("[%s] WAIT_CLEAR -> all clear -> IDLE\n", side);
+        sm.state = DOOR_IDLE;
+      } else if (now - sm.stateEntryTime > clearTimeout) {
+        Serial.printf("[%s] WAIT_CLEAR timeout -> IDLE\n", side);
+        sm.state = DOOR_IDLE;
+      }
+      break;
+    }
+  }
+
+  return pendingEvent;
 }
 
-// ========== Counting State Machine ==========
-// Direction is determined by which row (outer vs inner) triggers first.
-//   Outer first → person walking IN from hallway  → entry (+1)
-//   Inner first → person walking OUT from room    → exit  (-1)
-//
-// A count is only registered when the person crosses BOTH beams,
-// and the first-triggered beam clears first (confirming forward motion).
-// If the second-triggered beam clears first, the person turned back → no count.
+// ========== Counting Orchestrator ==========
+// Runs both per-side state machines and merges their results.
 //
 // Handled cases:
-//   • Normal walk in / out (any speed)
-//   • Fast walk-through (both beams trigger nearly simultaneously)
-//   • Partial entry then reversal → no count
-//   • Partial exit then reversal  → no count
-//   • Off-center walk (only one sensor per row triggers)
-//   • Tailgating: after a count, waits for ALL beams to clear before re-arming
-//   • Wheelchair: detects wide objects (both L+R sensors active) and extends
-//     the clear-wait timeout so the person pushing isn't double-counted
-void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
-  updateDebouncedRows(outerRaw, innerRaw);
+//   • Normal walk in / out (any speed) — one side triggers
+//   • Shoulder-to-shoulder opposite directions — each side detects independently,
+//     one counts +1 and the other counts -1; net = 0 (correct)
+//   • Wheelchair (~635mm wide) — both sides fire simultaneously;
+//     only left side's count is applied to avoid double-counting
+//   • Tailgating — WAIT_CLEAR on each side prevents re-arm confusion
+//   • Partial entry/exit, fast walk-through, off-center walk — all preserved
+void updateCounting(uint16_t dist[4]) {
+  // Per-sensor raw activation
+  bool loRaw = isSensorActive(LO, dist);
+  bool liRaw = isSensorActive(LI, dist);
+  bool roRaw = isSensorActive(RO, dist);
+  bool riRaw = isSensorActive(RI, dist);
 
-  bool outerActive = outerConfirmed;
-  bool innerActive = innerConfirmed;
-  bool anyActive   = outerActive || innerActive;
-  unsigned long now = millis();
+  bool anyActive = loRaw || liRaw || roRaw || riRaw;
 
-  // Continuously check for wide objects while any beam is active
-  if (anyActive && isWideObject(dist)) {
+  // Wide-object detection: both L+R on the same row simultaneously blocked
+  if (anyActive && ((loRaw && roRaw) || (liRaw && riRaw))) {
     if (!wideObjectDetected) {
       Serial.println("[SM] Wide object detected (wheelchair?)");
     }
     wideObjectDetected = true;
   }
+  if (!anyActive) wideObjectDetected = false;
 
-  // Track last time anything was active
-  if (anyActive) lastActiveTime = now;
+  // Run both side state machines
+  int leftDir  = updateSide(leftSM,  loRaw, liRaw, "L");
+  int rightDir = updateSide(rightSM, roRaw, riRaw, "R");
 
-  // Inactivity reset: if nothing detected for a while, go back to IDLE.
-  // Exception: DOOR_BOTH_ACTIVE must continue processing even if both
-  // beams just cleared (both-clear-at-once case).
-  if (!anyActive && doorState != DOOR_BOTH_ACTIVE) {
-    // WAIT_CLEAR: both beams are now clear after a count → go to IDLE
-    if (doorState == DOOR_WAIT_CLEAR) {
-      Serial.printf("[SM:%s] All clear -> IDLE, ready for next person\n", doorStateStr(doorState));
-      wideObjectDetected = false;
-      doorState = DOOR_IDLE;
-      return;
-    }
-    if (now - lastActiveTime > INACTIVITY_TIMEOUT) {
-      if (doorState != DOOR_IDLE) {
-        Serial.printf("[SM:%s] Inactivity timeout -> IDLE\n", doorStateStr(doorState));
-      }
-      wideObjectDetected = false;
-      doorState = DOOR_IDLE;
-    }
-    return;
-  }
-
-  switch (doorState) {
-
-    // ── IDLE: waiting for someone to break a beam ──────────────────────
-    case DOOR_IDLE:
-      if (outerActive && !innerActive) {
-        doorState = DOOR_OUTER_FIRST;
-        stateEntryTime = now;
-        Serial.printf("[SM:%s] Outer first -> potential ENTRY\n", doorStateStr(doorState));
-
-      } else if (innerActive && !outerActive) {
-        doorState = DOOR_INNER_FIRST;
-        stateEntryTime = now;
-        Serial.printf("[SM:%s] Inner first -> potential EXIT\n", doorStateStr(doorState));
-
-      } else if (outerActive && innerActive) {
-        // Fast walk: both triggered in same loop cycle.
-        // We can't know order, default to entry (outer-first).
-        doorState = DOOR_BOTH_ACTIVE;
-        outerWasFirst = true;
-        stateEntryTime = now;
-        Serial.printf("[SM:%s] Both beams at once -> assume ENTRY\n", doorStateStr(doorState));
-      }
-      break;
-
-    // ── OUTER_FIRST: outer beam broken, waiting for inner ──────────────
-    case DOOR_OUTER_FIRST:
-      if (innerActive) {
-        // Second beam confirmed → enter BOTH_ACTIVE
-        doorState = DOOR_BOTH_ACTIVE;
-        outerWasFirst = true;
-        Serial.printf("[SM:%s] Inner now active -> BOTH_ACTIVE\n", doorStateStr(doorState));
-
-      } else if (!outerActive) {
-        // Outer cleared without inner ever triggering → partial, no count
-        Serial.printf("[SM:%s] Outer cleared alone -> partial, no count\n", doorStateStr(doorState));
-        doorState = DOOR_IDLE;
-
-      } else if (now - stateEntryTime > PARTIAL_TIMEOUT) {
-        // Loitering in front of outer beam too long
-        Serial.printf("[SM:%s] Partial entry timeout -> IDLE\n", doorStateStr(doorState));
-        doorState = DOOR_IDLE;
-      }
-      break;
-
-    // ── INNER_FIRST: inner beam broken, waiting for outer ──────────────
-    case DOOR_INNER_FIRST:
-      if (outerActive) {
-        // Second beam confirmed → enter BOTH_ACTIVE
-        doorState = DOOR_BOTH_ACTIVE;
-        outerWasFirst = false;
-        Serial.printf("[SM:%s] Outer now active -> BOTH_ACTIVE\n", doorStateStr(doorState));
-
-      } else if (!innerActive) {
-        // Inner cleared without outer ever triggering → partial, no count
-        Serial.printf("[SM:%s] Inner cleared alone -> partial, no count\n", doorStateStr(doorState));
-        doorState = DOOR_IDLE;
-
-      } else if (now - stateEntryTime > PARTIAL_TIMEOUT) {
-        // Loitering in front of inner beam too long
-        Serial.printf("[SM:%s] Partial exit timeout -> IDLE\n", doorStateStr(doorState));
-        doorState = DOOR_IDLE;
-      }
-      break;
-
-    // ── BOTH_ACTIVE: both beams broken, waiting for resolution ─────────
-    case DOOR_BOTH_ACTIVE: {
-
-      if (!outerActive && !innerActive) {
-        // ── Both cleared at once ──
-        int dir = outerWasFirst ? 1 : -1;
-        Serial.printf("[SM:%s] Both cleared -> %s\n", doorStateStr(doorState),
-                      dir == 1 ? "ENTRY" : "EXIT");
-        countEvent(dir);
-        doorState = DOOR_IDLE;
-
-      } else if (!outerActive && innerActive) {
-        // ── Outer cleared first ──
-        if (outerWasFirst) {
-          // Outer triggered first AND cleared first → person moved through → ENTRY
-          Serial.printf("[SM:%s] Outer cleared first (was first) -> ENTRY\n", doorStateStr(doorState));
-          countEvent(1);
-        } else {
-          // Inner triggered first, but outer (second) cleared first → turned back
-          Serial.printf("[SM:%s] Outer cleared first (was second) -> turned back, NO COUNT\n", doorStateStr(doorState));
-        }
-        // Wait for ALL beams to clear before re-arming.
-        // Going to IDLE here would immediately re-detect the still-active inner
-        // beam as INNER_FIRST, pre-assigning "exit" for the next person — but
-        // a tailgater is usually walking the SAME direction.  WAIT_CLEAR prevents
-        // the leftover signal from poisoning the next sequence.
-        doorState = DOOR_WAIT_CLEAR;
-        stateEntryTime = now;
-        Serial.printf("[SM] -> WAIT_CLEAR (inner still active)\n");
-
-      } else if (!innerActive && outerActive) {
-        // ── Inner cleared first ──
-        if (!outerWasFirst) {
-          // Inner triggered first AND cleared first → person moved through → EXIT
-          Serial.printf("[SM:%s] Inner cleared first (was first) -> EXIT\n", doorStateStr(doorState));
-          countEvent(-1);
-        } else {
-          // Outer triggered first, but inner (second) cleared first → turned back
-          Serial.printf("[SM:%s] Inner cleared first (was second) -> turned back, NO COUNT\n", doorStateStr(doorState));
-        }
-        // Same reasoning: wait for all clear.
-        doorState = DOOR_WAIT_CLEAR;
-        stateEntryTime = now;
-        Serial.printf("[SM] -> WAIT_CLEAR (outer still active)\n");
-      }
-      // else: both still active → keep waiting
-      break;
-    }
-
-    // ── WAIT_CLEAR: count just fired, wait for doorway to clear ────────
-    //    This prevents a tailgater's residual beam from being misread
-    //    as the first trigger of a new opposite-direction sequence.
-    case DOOR_WAIT_CLEAR: {
-      // Use a longer timeout for wheelchairs — the pusher behind the chair
-      // keeps the beams blocked much longer than a single person would.
-      unsigned long clearTimeout = wideObjectDetected ? WHEELCHAIR_CLEAR_TIMEOUT : PARTIAL_TIMEOUT;
-
-      if (!outerActive && !innerActive) {
-        // Doorway fully clear → ready for next person
-        Serial.printf("[SM:%s] All clear -> IDLE\n", doorStateStr(doorState));
-        wideObjectDetected = false;
-        doorState = DOOR_IDLE;
-      } else if (now - stateEntryTime > clearTimeout) {
-        // Safety: if beams stay blocked too long (e.g. object in doorway),
-        // force back to IDLE so we don't get stuck.
-        Serial.printf("[SM:%s] Timeout waiting for clear -> IDLE\n", doorStateStr(doorState));
-        doorState = DOOR_IDLE;
-      }
-      // else: still waiting for beams to clear
-      break;
-    }
-  }
+  // Apply count events.
+  // When a wide object is detected, only the left side counts to prevent
+  // double-counting a wheelchair that blocks both L+R sensors.
+  if (leftDir != 0) countEvent(leftDir);
+  if (rightDir != 0 && !wideObjectDetected) countEvent(rightDir);
 }
 
 // Record an event (direction: +1 entry, -1 exit)
