@@ -299,7 +299,7 @@ void readAllDistances(uint16_t dist[4]) {
 
 // ========== Per-Sensor Detection ==========
 bool isSensorActive(int idx, uint16_t dist[4]) {
-  return sensorOK[idx] && dist[idx] < DETECT_THRESH && dist[idx] > 50;
+  return sensorOK[idx] && dist[idx] < DETECT_THRESH;
 }
 
 // ========== Per-Side State Machine ==========
@@ -522,28 +522,54 @@ void updateCounting(uint16_t dist[4]) {
   // --- Shoulder-by-shoulder counting logic ---
 
   // Cross-diagonal pattern: opposite direction shoulder-by-shoulder.
-  // Pattern A (enter right, exit left): RO<=NEAR && LI<=NEAR && RI<=DETECT && LO<=DETECT
-  // Pattern B (enter left, exit right): LO<=NEAR && RI<=NEAR && LI<=DETECT && RO<=DETECT
+  // As two people cross, the sensor pattern transitions:
+  //   Phase 1 (crossA): RO<=NEAR && LI<=NEAR (person entering right, exiting left)
+  //   Phase 2 (crossB): LO<=NEAR && RI<=NEAR (they've passed each other)
+  // Seeing BOTH patterns in sequence confirms a real opposite-direction crossing.
   bool crossA = (dist[RO] <= NEAR_THRESH && dist[LI] <= NEAR_THRESH &&
                  dist[RI] <= DETECT_THRESH && dist[LO] <= DETECT_THRESH);
   bool crossB = (dist[LO] <= NEAR_THRESH && dist[RI] <= NEAR_THRESH &&
                  dist[LI] <= DETECT_THRESH && dist[RO] <= DETECT_THRESH);
   bool crossDetected = crossA || crossB;
 
-  // Opposite directions: both sides fired on same tick but cancelled (net=0).
-  // Apply each event independently so neither is lost.
-  if (crossDetected && leftDir != 0 && rightDir != 0 && netCount == 0) {
-    Serial.printf("[COUNT] Opposite shoulder-by-shoulder: L=%+d R=%+d\n", leftDir, rightDir);
+  // Track when each cross pattern was last seen
+  static unsigned long lastCrossATime = 0;
+  static unsigned long lastCrossBTime = 0;
+  static bool crossSequenceUsed = false;  // prevent re-triggering
+  unsigned long now = millis();
+
+  if (crossA) lastCrossATime = now;
+  if (crossB) lastCrossBTime = now;
+
+  // A confirmed crossing = crossA then crossB (or B then A) within a time window
+  bool crossSequence = false;
+  if (crossA && lastCrossBTime > 0 && (now - lastCrossBTime) < PARTIAL_TIMEOUT && !crossSequenceUsed) {
+    crossSequence = true;
+  }
+  if (crossB && lastCrossATime > 0 && (now - lastCrossATime) < PARTIAL_TIMEOUT && !crossSequenceUsed) {
+    crossSequence = true;
+  }
+
+  // Opposite directions: confirmed cross sequence AND both sides fired (net=0).
+  if (crossSequence && leftDir != 0 && rightDir != 0 && netCount == 0) {
+    Serial.printf("[COUNT] Opposite shoulder-by-shoulder (cross sequence): L=%+d R=%+d\n", leftDir, rightDir);
     countEvent(leftDir);
     countEvent(rightDir);
+    crossSequenceUsed = true;  // don't re-trigger for this crossing
     return;
+  }
+
+  // Reset cross sequence tracking when both sides go idle
+  if (leftSM.state == DOOR_IDLE && rightSM.state == DOOR_IDLE) {
+    crossSequenceUsed = false;
+    lastCrossATime = 0;
+    lastCrossBTime = 0;
   }
 
   // Same direction: one side fired, other hasn't resolved yet.
   // Boost to ±2 and force the non-firing side to WAIT_CLEAR.
-  // SKIP if cross-diagonal detected — that means opposite-direction traversal,
-  // the other event will arrive on a later tick (cooldown won't block it
-  // because the signs are different).
+  // SKIP if any cross-diagonal pattern is active — that means potential
+  // opposite-direction traversal; let it resolve naturally.
   if (!crossDetected && (netCount == 1 || netCount == -1)) {
     bool leftNear  = (dist[LO] < NEAR_THRESH || dist[LI] < NEAR_THRESH);
     bool rightNear = (dist[RO] < NEAR_THRESH || dist[RI] < NEAR_THRESH);
