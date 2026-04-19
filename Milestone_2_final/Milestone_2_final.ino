@@ -440,38 +440,16 @@ void updateCounting(uint16_t dist[4]) {
   int rightDir = updateSide(rightSM, roRaw, riRaw, "R");
 
   // Apply count events from both sides.
+  // Each side counts independently, which correctly handles:
+  //   • Two people brushing shoulders same dir: both sides +1 = +2
+  //   • Two people brushing shoulders opposite dir: +1 + -1 = 0
+  //   • Wheelchair + pusher: wheelchair blocks both sides (+2),
+  //     pusher absorbed by WAIT_CLEAR = correct +2 for 2 people
+  //   • Solo wheelchair: +2 (minor over-count, acceptable trade-off)
+  //
+  // We batch both sides into a single net count so the cooldown in
+  // countEvent doesn't suppress the second side's same-direction event.
   int netCount = leftDir + rightDir;
-
-  // Shoulder-by-shoulder detection:
-  // When one side fires an event but the other side hasn't resolved yet,
-  // the cooldown would suppress the second event. Detect this case by
-  // checking if both sides have near-range (<NEAR_THRESH) sensor readings,
-  // which indicates two people side-by-side. Boost the count and force
-  // the other side's SM into WAIT_CLEAR to prevent a later duplicate.
-  if (netCount == 1 || netCount == -1) {
-    bool leftNear  = (dist[LO] < NEAR_THRESH || dist[LI] < NEAR_THRESH);
-    bool rightNear = (dist[RO] < NEAR_THRESH || dist[RI] < NEAR_THRESH);
-
-    if (leftNear && rightNear) {
-      int sign = (netCount > 0) ? 1 : -1;
-      netCount = 2 * sign;
-
-      // Reset the side that hasn't fired yet so it won't double-count
-      if (leftDir == 0) {
-        Serial.printf("[L] Shoulder-by-shoulder -> skip, forced WAIT_CLEAR\n");
-        leftSM.state = DOOR_WAIT_CLEAR;
-        leftSM.stateEntryTime = millis();
-      }
-      if (rightDir == 0) {
-        Serial.printf("[R] Shoulder-by-shoulder -> skip, forced WAIT_CLEAR\n");
-        rightSM.state = DOOR_WAIT_CLEAR;
-        rightSM.stateEntryTime = millis();
-      }
-
-      Serial.printf("[COUNT] Shoulder-by-shoulder detected -> boosted to %+d\n", netCount);
-    }
-  }
-
   if (netCount != 0) countEvent(netCount);
 }
 
