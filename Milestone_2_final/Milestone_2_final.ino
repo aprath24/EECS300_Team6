@@ -517,10 +517,12 @@ void handleWiFiClient(uint16_t dist[4]) {
         break;
     }
 
-    // Always respond with the current count + sensor distances
+    // Always respond with the current count + sensor distances + door states
+    // Format: #<count>,<LI>,<LO>,<RI>,<RO>,<leftState>,<rightState>\n
     String response = "#" + String(peopleCount) + ","
                     + String(dist[LI]) + "," + String(dist[LO]) + ","
-                    + String(dist[RI]) + "," + String(dist[RO]) + "\n";
+                    + String(dist[RI]) + "," + String(dist[RO]) + ","
+                    + String((int)leftSM.state) + "," + String((int)rightSM.state) + "\n";
     client.print(response);
     client.stop();
   }

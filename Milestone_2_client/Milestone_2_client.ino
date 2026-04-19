@@ -2,6 +2,7 @@
  * Client board for people counter system.
  * 
  * - Polls the server for the current people count and displays it on the OLED.
+ * - Shows debug info: sensor distances and door state machine states.
  * - Pressing the boot button sends a reset command (#0) to the server
  *   to set the count back to zero.
  * 
@@ -28,8 +29,20 @@ uint32_t is_pressed();
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // Shared variables (between main core and WiFi core)
-volatile shared_uint32 x;           // server count: WiFi core writes, main core reads
-volatile shared_uint32 reset_flag;  // reset request: main core writes 1, WiFi core reads & clears
+volatile shared_server_data serverData;  // full server response (WiFi -> main)
+volatile shared_uint32 reset_flag;       // reset request: main core writes 1, WiFi core reads & clears
+
+// Convert door state enum value to readable string
+const char* doorStateStr(uint8_t s) {
+  switch (s) {
+    case 0:  return "IDLE";
+    case 1:  return "OUTER_1ST";
+    case 2:  return "INNER_1ST";
+    case 3:  return "BOTH";
+    case 4:  return "WAIT_CLR";
+    default: return "???";
+  }
+}
 
 void setup()
 {
@@ -45,7 +58,13 @@ void setup()
     while(1);
   }
 
-  INIT_SHARED_VARIABLE(x, 0);
+  // Initialize shared variables
+  serverData.count = 0;
+  serverData.distLI = 0; serverData.distLO = 0;
+  serverData.distRI = 0; serverData.distRO = 0;
+  serverData.leftState = 0; serverData.rightState = 0;
+  serverData.sem = xSemaphoreCreateMutex();
+
   INIT_SHARED_VARIABLE(reset_flag, 0);
   init_wifi_task();
   
@@ -69,39 +88,60 @@ void loop()
     Serial.println("[BTN] Reset requested");
   }
 
-  // Read the latest server count from the WiFi core
+  // Read the latest server data from the WiFi core
   uint32_t count;
-  LOCK_SHARED_VARIABLE(x);
-  count = x.value;
-  UNLOCK_SHARED_VARIABLE(x);
+  uint16_t dLI, dLO, dRI, dRO;
+  uint8_t  lState, rState;
 
-  // Serial.println("the count is: " + String(count));
+  LOCK_SHARED_VARIABLE(serverData);
+  count  = serverData.count;
+  dLI    = serverData.distLI;
+  dLO    = serverData.distLO;
+  dRI    = serverData.distRI;
+  dRO    = serverData.distRO;
+  lState = serverData.leftState;
+  rState = serverData.rightState;
+  UNLOCK_SHARED_VARIABLE(serverData);
 
-  // Update the OLED with the current people count
-  update_oled(count);
+  // Update the OLED with debug info
+  update_oled(count, dLI, dLO, dRI, dRO, lState, rState);
   
   // Moderate refresh rate
   delay(100);
 }
 
 
-void update_oled(uint32_t count) {
+void update_oled(uint32_t count, uint16_t dLI, uint16_t dLO,
+                 uint16_t dRI, uint16_t dRO,
+                 uint8_t lState, uint8_t rState) {
   display.clearDisplay();
   
-  // Header
+  // Row 0: Header + count (large)
   display.setTextSize(1);
-  display.setCursor(0,0);
-  display.println("PEOPLE COUNTER");
-  display.drawLine(0, 12, 128, 12, SSD1306_WHITE);
-
-  // Count Label
-  display.setCursor(0, 20);
-  display.println("Total Inside:");
-
-  // Large Count Display
-  display.setTextSize(4);
-  display.setCursor(40, 32);
+  display.setCursor(0, 0);
+  display.print("COUNT:");
+  display.setTextSize(2);
+  display.setCursor(50, 0);
   display.print(count);
+
+  // Row 2: Separator
+  display.drawLine(0, 18, 128, 18, SSD1306_WHITE);
+
+  // Row 3: Sensor distances
+  display.setTextSize(1);
+  display.setCursor(0, 22);
+  display.printf("LI:%4u LO:%4u", dLI, dLO);
+  display.setCursor(0, 32);
+  display.printf("RI:%4u RO:%4u", dRI, dRO);
+
+  // Row 5: Separator
+  display.drawLine(0, 42, 128, 42, SSD1306_WHITE);
+
+  // Row 6-7: Door states
+  display.setCursor(0, 46);
+  display.printf("L: %s", doorStateStr(lState));
+  display.setCursor(0, 56);
+  display.printf("R: %s", doorStateStr(rState));
   
   display.display();
 }

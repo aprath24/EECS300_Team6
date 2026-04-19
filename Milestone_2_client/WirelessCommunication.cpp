@@ -17,8 +17,8 @@ static const uint16_t port = 80;
 static WiFiMulti multi;
 
 //used to share data between cores
-extern volatile shared_uint32 x;           // server count (WiFi -> main)
-extern volatile shared_uint32 reset_flag;  // reset request (main -> WiFi)
+extern volatile shared_server_data serverData;  // full server response (WiFi -> main)
+extern volatile shared_uint32 reset_flag;       // reset request (main -> WiFi)
 
 //like setup() and loop(), but run on the other core
 
@@ -27,7 +27,7 @@ void setup1()
   wireless_init();//init WiFi hardware and connect to network
 }
 
-// Polls the server for the current count.
+// Polls the server for the current count + debug data.
 // If the main core requested a reset, sends "#0" first.
 void loop1()
 {
@@ -39,12 +39,7 @@ void loop1()
   UNLOCK_SHARED_VARIABLE(reset_flag);
   
   // Poll the server (and send reset if requested)
-  uint32_t server_count = poll_server(do_reset);
-  
-  // Pass server count back to main core for OLED display
-  LOCK_SHARED_VARIABLE(x);
-  x.value = server_count;
-  UNLOCK_SHARED_VARIABLE(x);
+  poll_server(do_reset);
   
   rest(200); // poll ~5 times per second
 }
@@ -135,13 +130,12 @@ static String read_from_server(WiFiClient &client)
  * Function:  poll_server
  * --------------------
  * Connects to the server, optionally sends a reset command,
- * then reads back the server's current count.
+ * then reads back the server's current count + debug data.
+ * Parses: #<count>,<LI>,<LO>,<RI>,<RO>,<leftState>,<rightState>
  * 
  * do_reset: if non-zero, sends "#0" to reset server count to 0
- * 
- * returns: the server's current people count
  */
-static uint32_t poll_server(uint32_t do_reset)
+static void poll_server(uint32_t do_reset)
 {
   WiFiClient client;
   connect_to_server(client);
@@ -152,21 +146,47 @@ static uint32_t poll_server(uint32_t do_reset)
     write_to_server(client, "\n");    // empty request = just read
   }
 
-  // Server responds with: "#<count>,<LI>,<LO>,<RI>,<RO>\n"
+  // Server responds with: "#<count>,<LI>,<LO>,<RI>,<RO>,<leftState>,<rightState>\n"
   String response = read_from_server(client);
   client.stop();
 
-  // Parse the count from the response
+  // Parse the full response into shared data
   uint32_t count = 0;
+  uint16_t dLI = 0, dLO = 0, dRI = 0, dRO = 0;
+  uint8_t  lState = 0, rState = 0;
+
   if (response.length() > 0 && response[0] == '#') {
-    int commaIdx = response.indexOf(',');
-    if (commaIdx > 0) {
-      count = response.substring(1, commaIdx).toInt();
-    } else {
-      count = response.substring(1).toInt();
+    // Tokenize by commas: count, LI, LO, RI, RO, leftState, rightState
+    int idx = 1;  // skip '#'
+    int field = 0;
+    while (idx <= (int)response.length() && field < 7) {
+      int nextComma = response.indexOf(',', idx);
+      if (nextComma < 0) nextComma = response.length();
+      String token = response.substring(idx, nextComma);
+      switch (field) {
+        case 0: count  = token.toInt(); break;
+        case 1: dLI    = token.toInt(); break;
+        case 2: dLO    = token.toInt(); break;
+        case 3: dRI    = token.toInt(); break;
+        case 4: dRO    = token.toInt(); break;
+        case 5: lState = token.toInt(); break;
+        case 6: rState = token.toInt(); break;
+      }
+      idx = nextComma + 1;
+      field++;
     }
   }
-  return count;
+
+  // Pass all parsed data to main core
+  LOCK_SHARED_VARIABLE(serverData);
+  serverData.count   = count;
+  serverData.distLI  = dLI;
+  serverData.distLO  = dLO;
+  serverData.distRI  = dRI;
+  serverData.distRO  = dRO;
+  serverData.leftState  = lState;
+  serverData.rightState = rState;
+  UNLOCK_SHARED_VARIABLE(serverData);
 }
 
 static void handle_reboot_request(WiFiClient &client)

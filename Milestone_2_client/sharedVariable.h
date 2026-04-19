@@ -44,6 +44,15 @@ typedef struct shared_double
   SemaphoreHandle_t sem;
 } shared_double;
 
+// Full server response: count + sensor distances + door states
+typedef struct shared_server_data
+{
+  uint32_t count;
+  uint16_t distLI, distLO, distRI, distRO;
+  uint8_t  leftState, rightState;  // DoorState enum values (0-4)
+  SemaphoreHandle_t sem;
+} shared_server_data;
+
 //add more types (e.g., string) if needed
 
 
