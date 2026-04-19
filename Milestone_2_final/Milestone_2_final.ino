@@ -65,6 +65,12 @@ unsigned long lastActiveTime  = 0;   // last time any beam was active
 // Direction tracking: set when entering BOTH_ACTIVE
 bool outerWasFirst = false;
 
+// Wide-object (wheelchair) detection:
+// A wheelchair (~635mm) blocks BOTH left and right sensors on a row at once.
+// A person typically only blocks one.  When detected, WAIT_CLEAR uses a
+// longer timeout so the person pushing behind doesn't get double-counted.
+bool wideObjectDetected = false;
+
 // Cooldown: prevent double-counts for the same person
 unsigned long lastEventTime = 0;
 int lastDirection = 0;   // 1=entry, -1=exit
@@ -288,6 +294,20 @@ bool isInnerRowActive(uint16_t dist[4]) {
          (sensorOK[RI] && dist[RI] < DETECT_THRESH && dist[RI] > 50);
 }
 
+// ========== Wide-Object (Wheelchair) Detection ==========
+// Returns true if BOTH left and right sensors on either row are simultaneously
+// detecting something.  A wheelchair (~635mm wide) blocks both sensors;
+// a single person typically only blocks one.
+bool isWideObject(uint16_t dist[4]) {
+  bool outerWide = sensorOK[LO] && sensorOK[RO]
+                && dist[LO] < DETECT_THRESH && dist[LO] > 50
+                && dist[RO] < DETECT_THRESH && dist[RO] > 50;
+  bool innerWide = sensorOK[LI] && sensorOK[RI]
+                && dist[LI] < DETECT_THRESH && dist[LI] > 50
+                && dist[RI] < DETECT_THRESH && dist[RI] > 50;
+  return outerWide || innerWide;
+}
+
 // ========== Debounced Row Detection ==========
 // Returns true only if the raw row signal has been continuously active
 // for at least DEBOUNCE_MS.  This filters out momentary noise / reflections
@@ -330,6 +350,8 @@ void updateDebouncedRows(bool outerRaw, bool innerRaw) {
 //   • Partial exit then reversal  → no count
 //   • Off-center walk (only one sensor per row triggers)
 //   • Tailgating: after a count, waits for ALL beams to clear before re-arming
+//   • Wheelchair: detects wide objects (both L+R sensors active) and extends
+//     the clear-wait timeout so the person pushing isn't double-counted
 void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
   updateDebouncedRows(outerRaw, innerRaw);
 
@@ -337,6 +359,14 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
   bool innerActive = innerConfirmed;
   bool anyActive   = outerActive || innerActive;
   unsigned long now = millis();
+
+  // Continuously check for wide objects while any beam is active
+  if (anyActive && isWideObject(dist)) {
+    if (!wideObjectDetected) {
+      Serial.println("[SM] Wide object detected (wheelchair?)");
+    }
+    wideObjectDetected = true;
+  }
 
   // Track last time anything was active
   if (anyActive) lastActiveTime = now;
@@ -348,6 +378,7 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
     // WAIT_CLEAR: both beams are now clear after a count → go to IDLE
     if (doorState == DOOR_WAIT_CLEAR) {
       Serial.printf("[SM:%s] All clear -> IDLE, ready for next person\n", doorStateStr(doorState));
+      wideObjectDetected = false;
       doorState = DOOR_IDLE;
       return;
     }
@@ -355,6 +386,7 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
       if (doorState != DOOR_IDLE) {
         Serial.printf("[SM:%s] Inactivity timeout -> IDLE\n", doorStateStr(doorState));
       }
+      wideObjectDetected = false;
       doorState = DOOR_IDLE;
     }
     return;
@@ -476,12 +508,17 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
     // ── WAIT_CLEAR: count just fired, wait for doorway to clear ────────
     //    This prevents a tailgater's residual beam from being misread
     //    as the first trigger of a new opposite-direction sequence.
-    case DOOR_WAIT_CLEAR:
+    case DOOR_WAIT_CLEAR: {
+      // Use a longer timeout for wheelchairs — the pusher behind the chair
+      // keeps the beams blocked much longer than a single person would.
+      unsigned long clearTimeout = wideObjectDetected ? WHEELCHAIR_CLEAR_TIMEOUT : PARTIAL_TIMEOUT;
+
       if (!outerActive && !innerActive) {
         // Doorway fully clear → ready for next person
         Serial.printf("[SM:%s] All clear -> IDLE\n", doorStateStr(doorState));
+        wideObjectDetected = false;
         doorState = DOOR_IDLE;
-      } else if (now - stateEntryTime > PARTIAL_TIMEOUT) {
+      } else if (now - stateEntryTime > clearTimeout) {
         // Safety: if beams stay blocked too long (e.g. object in doorway),
         // force back to IDLE so we don't get stuck.
         Serial.printf("[SM:%s] Timeout waiting for clear -> IDLE\n", doorStateStr(doorState));
@@ -489,6 +526,7 @@ void updateCounting(bool outerRaw, bool innerRaw, uint16_t dist[4]) {
       }
       // else: still waiting for beams to clear
       break;
+    }
   }
 }
 

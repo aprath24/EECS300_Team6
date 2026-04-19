@@ -39,6 +39,11 @@ const unsigned long COOLDOWN_MS = 300;
 // Fully reset the state machine when nobody is detected for this long
 const unsigned long INACTIVITY_TIMEOUT = 1500;
 
+// After counting a wide object (wheelchair ~635mm), wait this long for ALL
+// beams to clear before re-arming.  The person pushing behind keeps the
+// beams blocked much longer than a solo walker.
+const unsigned long WHEELCHAIR_CLEAR_TIMEOUT = 4000;
+
 
 
 #endif // CONFIG_H
