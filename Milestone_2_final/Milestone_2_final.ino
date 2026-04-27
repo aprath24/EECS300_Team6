@@ -12,28 +12,20 @@ WiFiServer server(80);
 const char *ssid = "team6";  // TODO: Fill in with team number, must match in client sketch
 const char *password = "66666666";  // At least 8 chars, must match in client sketch
 
-
 esp_task_wdt_config_t watchdog = {.timeout_ms = 5000, .trigger_panic = true}; 
 
-
 // ========== Object Declarations ==========
-Adafruit_VL53L1X sensorsL1[4];   // Adafruit VL53L1X sensor objects
-Adafruit_VL53L0X sensorsL0[4];   // Adafruit VL53L0X sensor objects (fallback)
-bool useL1X = true;      // true = using L1X, false = using L0X (set during init)
-bool sensorOK[4] = {false, false, false, false};  // which sensors initialized
-int  numSensorsOK = 0;   // count of successfully initialized sensors
+Adafruit_VL53L1X sensorsL1[4];
+Adafruit_VL53L0X sensorsL0[4];
+bool useL1X = true;
+bool sensorOK[4] = {false, false, false, false};
+int  numSensorsOK = 0;
 
 // ========== Global Variables ==========
 volatile int32_t peopleCount = 0;
 Preferences nonVol;
 
 // ========== Per-Side State Machine ==========
-// Two independent state machines: one for the LEFT sensor pair (LO, LI)
-// and one for the RIGHT pair (RO, RI).  This lets the system handle:
-//   • Two people passing shoulder-to-shoulder in opposite directions
-//   • Wheelchairs (wide objects block both sides → only one count)
-//   • All the same cases as before (tailgating, partials, etc.)
-
 enum DoorState {
   DOOR_IDLE,          // Nobody detected
   DOOR_OUTER_FIRST,   // Outer sensor triggered first → potential entry
@@ -124,8 +116,6 @@ void setup() {
 
   // Boot button for count reset
   pinMode(BUTTON_PIN, INPUT);
-
-
   
   Wire.begin();
   Wire.setClock(400000);            // 400 kHz I2C
@@ -172,8 +162,6 @@ void loop() {
 }
 
 // ========== I2C Probe ==========
-// Quick check if any device ACKs at the given address.
-// Returns true if a device responded, false otherwise.
 bool i2cProbe(uint8_t addr) {
   Wire.beginTransmission(addr);
   return (Wire.endTransmission() == 0);
@@ -231,12 +219,11 @@ void initSensors() {
 
   // --- Init remaining sensors with the detected type ---
   for (int i = 0; i < 4; i++) {
-    if (sensorOK[i]) continue;  // already initialized above
+    if (sensorOK[i]) continue;
 
     pinMode(xshutPins[i], INPUT);
     delay(50);
 
-    // Quick I2C probe – skip if nothing on the bus
     if (!i2cProbe(0x29)) {
       Serial.printf("[INIT] Sensor %d (%s) not found on bus – skipping\n", i, sensorNames[i]);
       continue;
@@ -274,7 +261,7 @@ void initSensors() {
 void readAllDistances(uint16_t dist[4]) {
   for (int i = 0; i < 4; i++) {
     if (!sensorOK[i]) {
-      dist[i] = 2000;  // treat missing sensor as "no detection"
+      dist[i] = 2000;
       continue;
     }
     if (useL1X) {
@@ -303,8 +290,6 @@ bool isSensorActive(int idx, uint16_t dist[4]) {
 }
 
 // ========== Per-Side State Machine ==========
-// Runs the direction-detection state machine for one side (left or right).
-// Returns a pending count event: 0 = none, +1 = entry, -1 = exit.
 int updateSide(SideSM &sm, bool outerRaw, bool innerRaw, const char* side) {
   unsigned long now = millis();
 
@@ -443,15 +428,6 @@ int updateSide(SideSM &sm, bool outerRaw, bool innerRaw, const char* side) {
 
 // ========== Counting Orchestrator ==========
 // Runs both per-side state machines and merges their results.
-//
-// Handled cases:
-//   • Normal walk in / out (any speed) — one side triggers
-//   • Shoulder-to-shoulder opposite directions — each side detects independently,
-//     one counts +1 and the other counts -1; net = 0 (correct)
-//   • Wheelchair (~635mm wide) — both sides fire simultaneously;
-//     only left side's count is applied to avoid double-counting
-//   • Tailgating — WAIT_CLEAR on each side prevents re-arm confusion
-//   • Partial entry/exit, fast walk-through, off-center walk — all preserved
 void updateCounting(uint16_t dist[4]) {
   // Per-sensor raw activation
   bool loRaw = isSensorActive(LO, dist);
@@ -521,11 +497,6 @@ void updateCounting(uint16_t dist[4]) {
   }
   // --- Shoulder-by-shoulder counting logic ---
 
-  // Cross-diagonal pattern: opposite direction shoulder-by-shoulder.
-  // As two people cross, the sensor pattern transitions:
-  //   Phase 1 (crossA): RO<=NEAR && LI<=NEAR (person entering right, exiting left)
-  //   Phase 2 (crossB): LO<=NEAR && RI<=NEAR (they've passed each other)
-  // Seeing BOTH patterns in sequence confirms a real opposite-direction crossing.
   bool crossA = (dist[RO] <= NEAR_THRESH && dist[LI] <= NEAR_THRESH &&
                  dist[RI] <= DETECT_THRESH && dist[LO] <= DETECT_THRESH);
   bool crossB = (dist[LO] <= NEAR_THRESH && dist[RI] <= NEAR_THRESH &&
@@ -535,13 +506,12 @@ void updateCounting(uint16_t dist[4]) {
   // Track when each cross pattern was last seen
   static unsigned long lastCrossATime = 0;
   static unsigned long lastCrossBTime = 0;
-  static bool crossSequenceUsed = false;  // prevent re-triggering
+  static bool crossSequenceUsed = false;
   unsigned long now = millis();
 
   if (crossA) lastCrossATime = now;
   if (crossB) lastCrossBTime = now;
 
-  // A confirmed crossing = crossA then crossB (or B then A) within a time window
   bool crossSequence = false;
   if (crossA && lastCrossBTime > 0 && (now - lastCrossBTime) < PARTIAL_TIMEOUT && !crossSequenceUsed) {
     crossSequence = true;
@@ -566,10 +536,6 @@ void updateCounting(uint16_t dist[4]) {
     lastCrossBTime = 0;
   }
 
-  // Same direction: one side fired, other hasn't resolved yet.
-  // Boost to ±2 and force the non-firing side to WAIT_CLEAR.
-  // SKIP if any cross-diagonal pattern is active — that means potential
-  // opposite-direction traversal; let it resolve naturally.
   if (!crossDetected && (netCount == 1 || netCount == -1)) {
     bool leftNear  = (dist[LO] < NEAR_THRESH || dist[LI] < NEAR_THRESH);
     bool rightNear = (dist[RO] < NEAR_THRESH || dist[RI] < NEAR_THRESH);
@@ -601,9 +567,6 @@ void countEvent(int direction) {
   unsigned long now = millis();
   int sign = (direction > 0) ? 1 : -1;
 
-  // Cooldown guard: suppress duplicate same-direction events that fire
-  // faster than COOLDOWN_MS (same person still being tracked).
-  // Uses sign (entry vs exit), not magnitude, for comparison.
   if (lastDirection == sign && (now - lastEventTime) < COOLDOWN_MS) {
     Serial.printf("[COUNT] Suppressed duplicate %s within cooldown\n",
                   (sign == 1 ? "entry" : "exit"));
@@ -655,8 +618,6 @@ void handleWiFiClient(uint16_t dist[4]) {
       case '\0': // empty — just a read request
         break;
       default:
-        // Serial.print("[WiFi] Received: ");
-        // Serial.println(line);
         break;
     }
 
